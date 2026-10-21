@@ -66,7 +66,6 @@ public:
     camera_frame_param_ = declare_parameter<std::string>("camera_frame", "");
     hfov_deg_ = declare_parameter<double>("hfov_deg", 60.0);
     publish_debug_ = declare_parameter<bool>("publish_debug_image", false);
-    const auto tf_timeout_ms = declare_parameter<int>("tf_timeout_ms", 100);
 
     RangeConfig range_cfg;
     range_cfg.target_width = declare_parameter<double>("target_width", 0.2);
@@ -89,8 +88,6 @@ public:
     for (Color c : {Color::kRed, Color::kGreen, Color::kBlue}) {
       debouncers_[c] = std::make_unique<DetectionDebouncer>(db_cfg);
     }
-
-    tf_timeout_sec_ = static_cast<double>(tf_timeout_ms) / 1000.0;
 
     det_pub_ = create_publisher<fleet_msgs::msg::Detection>("detections", rclcpp::QoS(10));
     if (publish_debug_) {
@@ -196,8 +193,10 @@ private:
 
     geometry_msgs::msg::PointStamped world_pt;
     try {
-      // 用图像时间戳查 TF：仿真下 /clock 与图像戳同源，能得到与该帧严格对应的位姿
-      world_pt = tf_buffer_.transform(cam_pt, world_frame_, tf2::durationFromSec(tf_timeout_sec_));
+      // 用图像时间戳查 TF：仿真下 /clock 与图像戳同源，能得到与该帧严格对应的位姿。
+      // 刻意不传超时：TF 数据由本节点的执行器喂给 Buffer，在回调里带超时等待
+      // 等于自己等自己（tf2 会直接报错），拿不到就丢这一帧，去抖器会兜住。
+      world_pt = tf_buffer_.transform(cam_pt, world_frame_);
     } catch (const tf2::TransformException& ex) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "TF %s -> %s 查询失败，本帧检测丢弃: %s",
@@ -318,7 +317,6 @@ private:
   bool has_camera_model_{false};
   bool logged_camera_info_{false};
   int dropped_frames_{0};
-  double tf_timeout_sec_{0.1};
 
   CameraModel camera_model_;
   std::unique_ptr<Ranging> ranging_;

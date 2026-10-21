@@ -140,11 +140,11 @@ def generate_launch_description():
     #   3. 帧名在 nav2_robot1.yaml 里已写成 robot1_xxx，与 TF 树一致
     NAV2_NS = 'robot1'
 
-    def nav2_node(pkg, exe, node_name, extra_remaps=()):
+    def nav2_node(pkg, exe, node_name, extra_remaps=(), extra_params=None):
         return Node(
             package=pkg, executable=exe, name=node_name,
             namespace=NAV2_NS,
-            parameters=[nav2_params],
+            parameters=[nav2_params] + ([extra_params] if extra_params else []),
             remappings=[('/tf', '/tf'), ('/tf_static', '/tf_static')] + list(extra_remaps),
             condition=IfCondition(LaunchConfiguration('nav2')),
             output='screen')
@@ -159,8 +159,12 @@ def generate_launch_description():
                   [('/robot1/map', '/map')]),
         nav2_node('nav2_behaviors', 'behavior_server', 'behavior_server'),
         nav2_node('nav2_bt_navigator', 'bt_navigator', 'bt_navigator'),
+        # service_timeout 默认 5s：本机在 RViz + 双相机同时渲染时会超时，
+        # 表现为 get_state 请求发不出去、bringup 直接中止（实测遇到过两次）。
+        # 放宽到 20s 换启动成功率，代价是真挂时多等一会儿
         nav2_node('nav2_lifecycle_manager', 'lifecycle_manager',
-                  'lifecycle_manager_navigation'),
+                  'lifecycle_manager_navigation', (),
+                  {'service_timeout': 20.0}),
     ]
 
     # 延迟启动 Nav2：等 gz 出 clock、桥出 odom/scan、TF 树建起来之后再拉，
