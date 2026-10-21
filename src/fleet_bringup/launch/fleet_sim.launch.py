@@ -67,6 +67,8 @@ def generate_launch_description():
                               description='是否为 robot1 启动 Nav2 导航栈'),
         DeclareLaunchArgument('perception', default_value='true',
                               description='是否为每台车启动视觉感知节点'),
+        DeclareLaunchArgument('agent', default_value='true',
+                              description='是否为每台车启动执行代理（ExecuteTask action）'),
 
         # ① 物理服务端（-r 加载即运行）
         ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
@@ -191,6 +193,27 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('perception')),
             output='screen'))
     actions.append(TimerAction(period=6.0, actions=perception_nodes))
+
+    # ⑥'' 执行代理：每台车一个，对外提供 /robotN/execute_task action。
+    # 比 Nav2 晚一点起，避免首个任务在 Nav2 服务端就绪前就发进来
+    agent_nodes = []
+    for name, _x, _y in robots:
+        agent_nodes.append(Node(
+            package='fleet_agent',
+            executable='robot_agent',
+            name='robot_agent',
+            namespace=name,
+            parameters=[{
+                'robot_id': name,
+                'world_frame': 'map',
+                'standoff': 0.6,
+                'pre_dock_margin': 0.8,
+                'nav_timeout': 90.0,
+                'dock_timeout': 20.0,
+            }],
+            condition=IfCondition(LaunchConfiguration('agent')),
+            output='screen'))
+    actions.append(TimerAction(period=14.0, actions=agent_nodes))
 
     # ⑦ 集群可视化：RViz2 统一在 map 坐标系下显示两台车
     # 延迟启动：等 clock/TF/robot_description 就绪后再建视图，

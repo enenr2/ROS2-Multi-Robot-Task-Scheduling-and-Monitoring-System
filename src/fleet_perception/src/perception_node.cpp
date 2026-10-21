@@ -198,11 +198,23 @@ private:
       // 等于自己等自己（tf2 会直接报错），拿不到就丢这一帧，去抖器会兜住。
       world_pt = tf_buffer_.transform(cam_pt, world_frame_);
     } catch (const tf2::TransformException& ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                           "TF %s -> %s 查询失败，本帧检测丢弃: %s",
-                           camera_frame.c_str(), world_frame_.c_str(), ex.what());
-      dropped_frames_++;
-      return;
+      // 图像戳常常比最新 TF 早/晚几毫秒（传感器与位姿不同步），按图像时刻查
+      // 会报 extrapolation。这时退化成"用最新可用位姿"，误差远小于测距误差。
+      geometry_msgs::msg::PointStamped latest = cam_pt;
+      latest.header.stamp.sec = 0;
+      latest.header.stamp.nanosec = 0;
+      try {
+        world_pt = tf_buffer_.transform(latest, world_frame_);
+        tf_fallbacks_++;
+        RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
+                              "按图像时刻查 TF 失败，已退化为最新位姿: %s", ex.what());
+      } catch (const tf2::TransformException&) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "TF %s -> %s 查询失败，本帧检测丢弃: %s",
+                             camera_frame.c_str(), world_frame_.c_str(), ex.what());
+        dropped_frames_++;
+        return;
+      }
     }
 
     fleet_msgs::msg::Detection det;
@@ -317,6 +329,7 @@ private:
   bool has_camera_model_{false};
   bool logged_camera_info_{false};
   int dropped_frames_{0};
+  int tf_fallbacks_{0};
 
   CameraModel camera_model_;
   std::unique_ptr<Ranging> ranging_;
