@@ -65,6 +65,8 @@ def generate_launch_description():
                               description='是否启动 RViz2 集群可视化'),
         DeclareLaunchArgument('nav2', default_value='true',
                               description='是否为 robot1 启动 Nav2 导航栈'),
+        DeclareLaunchArgument('perception', default_value='true',
+                              description='是否为每台车启动视觉感知节点'),
 
         # ① 物理服务端（-r 加载即运行）
         ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
@@ -164,6 +166,27 @@ def generate_launch_description():
     # 延迟启动 Nav2：等 gz 出 clock、桥出 odom/scan、TF 树建起来之后再拉，
     # 否则生命周期节点会因拿不到初始位姿而卡在 inactive
     actions.append(TimerAction(period=10.0, actions=nav2_nodes))
+
+    # ⑥' 视觉感知：每台车一个节点，订阅各自命名空间下的相机，输出 detections
+    # 感知节点不依赖 Nav2，但依赖 TF 树（map <- robotN_camera_link），
+    # 所以稍等几秒再拉起，避免启动初期 TF 查询失败刷告警
+    perception_nodes = []
+    for name, _x, _y in robots:
+        perception_nodes.append(Node(
+            package='fleet_perception',
+            executable='perception_node',
+            name='perception_node',
+            namespace=name,
+            parameters=[{
+                'robot_id': name,
+                'world_frame': 'map',
+                'target_width': 0.2,
+                'max_range': 5.0,
+                'publish_debug_image': False,
+            }],
+            condition=IfCondition(LaunchConfiguration('perception')),
+            output='screen'))
+    actions.append(TimerAction(period=6.0, actions=perception_nodes))
 
     # ⑦ 集群可视化：RViz2 统一在 map 坐标系下显示两台车
     # 延迟启动：等 clock/TF/robot_description 就绪后再建视图，

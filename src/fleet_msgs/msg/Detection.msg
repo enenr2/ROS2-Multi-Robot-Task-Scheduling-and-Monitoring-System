@@ -11,6 +11,11 @@ string source_robot_id
 uint8 color
 float32 confidence           # 轮廓面积 / 参考面积，>1 表示目标偏大（更近）
 
+# 丢失事件标志：true 表示该颜色目标已连续丢帧超过阈值，本条是「目标丢失」通知，
+# 此时 bbox/world_pose/range 等几何字段无效（range 填 -1）。调度侧据此判定
+# "目标消失"并做任务取消或重分配
+bool lost
+
 # 像素域：基于与 header.stamp 同一帧的图像
 sensor_msgs/RegionOfInterest bbox
 
