@@ -134,7 +134,7 @@
 
       <sensor name="hls_lfcd_lds" type="gpu_lidar">
         <always_on>true</always_on>
-        <visualize>true</visualize>
+        <visualize>false</visualize>
         <pose>-0.032 0 0.171 0 0 0</pose>
         <update_rate>5</update_rate>
         <topic>robot2/scan</topic>
@@ -142,7 +142,7 @@
         <lidar>
           <scan>
             <horizontal>
-              <samples>360</samples>
+              <samples>180</samples>
               <resolution>1.000000</resolution>
               <min_angle>0.000000</min_angle>
               <max_angle>6.280000</max_angle>
@@ -159,6 +159,54 @@
             <stddev>0.01</stddev>
           </noise>
         </lidar>
+      </sensor>
+    </link>
+
+    <!-- 任务相机：60° 水平视场、15Hz、俯角 12°。
+         位姿必须与 URDF 的 camera_joint 一致 -->
+    <link name="camera_link">
+      <pose>0.03 0 0.15 0 0.21 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-06</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>1e-06</iyy><iyz>0</iyz><izz>1e-06</izz>
+        </inertia>
+      </inertial>
+      <collision name="camera_collision">
+        <geometry><box><size>0.02 0.06 0.02</size></box></geometry>
+      </collision>
+      <visual name="camera_visual">
+        <geometry><box><size>0.02 0.06 0.02</size></box></geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.1 0.1 0.1 1</diffuse>
+        </material>
+      </visual>
+
+      <sensor name="rgb_camera" type="camera">
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <update_rate>8</update_rate>
+        <topic>robot2/camera/image</topic>
+        <gz_frame_id>robot2_camera_link</gz_frame_id>
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>320</width>
+            <height>240</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>10.0</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
       </sensor>
     </link>
 
@@ -368,6 +416,15 @@
       <parent>base_link</parent>
       <child>base_scan</child>
       <pose>-0.032 0 0.171 0 0 0</pose>
+      <axis>
+        <xyz>0 0 1</xyz>
+      </axis>
+    </joint>
+
+    <joint name="camera_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+      <pose>0.03 0 0.15 0 0.21 0</pose>
       <axis>
         <xyz>0 0 1</xyz>
       </axis>

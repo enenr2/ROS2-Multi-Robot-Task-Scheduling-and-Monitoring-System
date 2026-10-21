@@ -20,7 +20,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-install(DIRECTORY launch config worlds models
+install(DIRECTORY launch config worlds models maps urdf
   DESTINATION share/${PROJECT_NAME})
+
+install(PROGRAMS scripts/gen_world_and_map.py
+  DESTINATION share/${PROJECT_NAME}/scripts)
 
 ament_package()

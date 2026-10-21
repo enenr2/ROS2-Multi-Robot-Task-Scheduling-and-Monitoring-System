@@ -34,6 +34,19 @@
   gz_type_name: "gz.msgs.Model"
   direction: GZ_TO_ROS
 
+# 任务相机：图像 + 内参（内参用于单目测距）
+- ros_topic_name: "/robot1/camera/image"
+  gz_topic_name: "/robot1/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/robot1/camera/camera_info"
+  gz_topic_name: "/robot1/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
 - ros_topic_name: "/tf"
   gz_topic_name: "/robot1/tf"
   ros_type_name: "tf2_msgs/msg/TFMessage"
@@ -69,6 +82,19 @@
   gz_topic_name: "/robot2/joint_states"
   ros_type_name: "sensor_msgs/msg/JointState"
   gz_type_name: "gz.msgs.Model"
+  direction: GZ_TO_ROS
+
+# 任务相机：图像 + 内参
+- ros_topic_name: "/robot2/camera/image"
+  gz_topic_name: "/robot2/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/robot2/camera/camera_info"
+  gz_topic_name: "/robot2/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
   direction: GZ_TO_ROS
 
 - ros_topic_name: "/tf"

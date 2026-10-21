@@ -15,12 +15,13 @@ def generate_launch_description():
     bringup = get_package_share_directory('fleet_bringup')
     tb3_gz = get_package_share_directory('turtlebot3_gazebo')
 
-    world_file = os.path.join(bringup, 'worlds', 'fleet_empty.sdf')
+    world_file = os.path.join(bringup, 'worlds', 'fleet_tasks.sdf')
     bridge_yaml = os.path.join(bringup, 'config', 'bridge.yaml')
     models_dir = os.path.join(bringup, 'models')
     tb3_models = os.path.join(tb3_gz, 'models')
-    urdf_file = os.path.join(tb3_gz, 'urdf', 'turtlebot3_burger.urdf')
+    urdf_file = os.path.join(bringup, 'urdf', 'turtlebot3_burger_fleet.urdf')
     rviz_config = os.path.join(bringup, 'config', 'fleet.rviz')
+    map_yaml = os.path.join(bringup, 'maps', 'fleet_map.yaml')
 
     with open(urdf_file, 'r') as f:
         urdf_text = f.read()
@@ -73,6 +74,17 @@ def generate_launch_description():
         Node(package='ros_gz_bridge', executable='parameter_bridge',
              parameters=[{'config_file': bridge_yaml}],
              output='screen'),
+        # ③' 静态地图：Nav2 的 costmap 与全局规划都以它为基准。
+        # map_server 是生命周期节点，靠 lifecycle_manager 自动 configure+activate
+        Node(package='nav2_map_server', executable='map_server',
+             name='fleet_map_server',
+             parameters=[{'yaml_filename': map_yaml}],
+             output='screen'),
+        Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
+             name='lifecycle_manager_map',
+             parameters=[{'autostart': True,
+                          'node_names': ['fleet_map_server']}],
+             output='screen'),
     ]
 
     for name, x, y in robots:
@@ -90,15 +102,15 @@ def generate_launch_description():
                         ('robot_description', name + '/robot_description')],
             output='screen'))
 
-        # 世界系 → 各车 odom 系的静态变换：
+        # map → 各车 odom 系的静态变换：
         # gz 的里程计以出生点为原点，所以用出生位姿当静态变换，
-        # 两台车才能同时显示在同一个 world 坐标系下
+        # 两台车才能同时显示在同一个地图坐标系下（帧名遵循 Nav2 惯例）
         actions.append(Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name=name + '_world_tf',
+            name=name + '_map_tf',
             arguments=['--x', x, '--y', y, '--z', '0',
-                       '--frame-id', 'world',
+                       '--frame-id', 'map',
                        '--child-frame-id', name + '_odom'],
             output='screen'))
 
