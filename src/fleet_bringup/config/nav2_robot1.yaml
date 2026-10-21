@@ -1,0 +1,232 @@
+# Nav2 单机导航参数（robot1）
+#
+# 两点关键约定，来自 nav2_bringup 官方 launch 的做法：
+#   1. 命名空间作为根键嵌套（RewrittenYaml 的 root_key），这样普通节点名
+#      才会被匹配到；实测顶层直接写 plain 节点名在命名空间下匹配不上
+#   2. 帧名必须带机器人前缀（robot1_xxx），因为两台车共用一棵 TF 树
+#
+# 不使用 AMCL：仿真里程计无噪声，map -> robot1_odom 由静态 TF 直接给出，
+# 定位是精确的，把精力留给调度与故障恢复。
+#
+# 控制器选 RPP 而非 MPPI：本机是软件渲染 VM，MPPI 默认 2000 条采样
+# 在这个环境下过重；RPP 更轻，且低速下轨迹质量足够。
+
+robot1:
+  controller_server:
+    ros__parameters:
+      use_sim_time: true
+      # Nav2 1.5 默认发布 TwistStamped，而 ros_gz_bridge 的 cmd_vel 条目配的是
+      # 标准 Twist，类型对不上会导致指令发不进仿真（表现为规划正常但车不动）。
+      # 关掉开关回到 Twist，与本项目既有的桥接配置一致。
+      enable_stamped_cmd_vel: false
+      controller_frequency: 10.0
+      costmap_update_timeout: 0.30
+      min_x_velocity_threshold: 0.001
+      min_y_velocity_threshold: 0.5
+      min_theta_velocity_threshold: 0.001
+      failure_tolerance: 0.3
+      progress_checker_plugins: ["progress_checker"]
+      goal_checker_plugins: ["general_goal_checker"]
+      controller_plugins: ["FollowPath"]
+      path_handler_plugins: ["PathHandler"]
+
+      progress_checker:
+        plugin: "nav2_controller::SimpleProgressChecker"
+        required_movement_radius: 0.3
+        movement_time_allowance: 20.0
+
+      general_goal_checker:
+        plugin: "nav2_controller::SimpleGoalChecker"
+        stateful: true
+        xy_goal_tolerance: 0.20
+        yaw_goal_tolerance: 0.30
+        path_length_tolerance: 1.0
+
+      PathHandler:
+        plugin: "nav2_controller::FeasiblePathHandler"
+        prune_distance: 2.0
+        enforce_path_inversion: false
+        enforce_path_rotation: false
+        inversion_xy_tolerance: 0.2
+        inversion_yaw_tolerance: 0.4
+        minimum_rotation_angle: 0.785
+        reject_unit_path: false
+
+      FollowPath:
+        plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+        desired_linear_vel: 0.18
+        lookahead_dist: 0.45
+        min_lookahead_dist: 0.30
+        max_lookahead_dist: 0.80
+        lookahead_time: 1.5
+        transform_tolerance: 0.2
+        use_velocity_scaled_lookahead_dist: true
+        min_approach_linear_velocity: 0.05
+        approach_velocity_scaling_dist: 0.5
+        use_collision_detection: true
+        max_allowed_time_to_collision_up_to_carrot: 1.0
+        use_regulated_linear_velocity_scaling: true
+        use_cost_regulated_linear_velocity_scaling: true
+        regulated_linear_scaling_min_radius: 0.9
+        regulated_linear_scaling_min_speed: 0.10
+        use_rotate_to_heading: true
+        rotate_to_heading_min_angle: 0.785
+        max_angular_accel: 2.0
+        max_robot_pose_search_dist: 10.0
+        allow_reversing: false
+        # 仿真里程计无噪声，用不上这些
+        use_odom_velocity: false
+
+  # 局部代价地图：滚动窗口跟随机器人，用于实时避障
+  local_costmap:
+    local_costmap:
+      ros__parameters:
+        use_sim_time: true
+        update_frequency: 5.0
+        publish_frequency: 2.0
+        global_frame: robot1_odom
+        robot_base_frame: robot1_base_footprint
+        rolling_window: true
+        width: 4
+        height: 4
+        resolution: 0.05
+        robot_radius: 0.12
+        plugins: ["obstacle_layer", "inflation_layer"]
+        transform_tolerance: 0.3
+        always_send_full_costmap: true
+        inflation_layer:
+          plugin: "nav2_costmap_2d::InflationLayer"
+          cost_scaling_factor: 3.0
+          inflation_radius: 0.35
+        obstacle_layer:
+          plugin: "nav2_costmap_2d::ObstacleLayer"
+          enabled: true
+          observation_sources: scan
+          scan:
+            # 用绝对话题，避免相对名在不同命名空间下解析出歧义
+            topic: /robot1/scan
+            max_obstacle_height: 2.0
+            clearing: true
+            marking: true
+            data_type: "LaserScan"
+            # 本车激光量程 3.5m，raytrace 不超过它，否则会出现"清不掉"的鬼影
+            raytrace_max_range: 3.0
+            raytrace_min_range: 0.0
+            obstacle_max_range: 2.5
+            obstacle_min_range: 0.0
+
+  # 全局代价地图：静态地图 + 实时障碍，用于全局规划
+  global_costmap:
+    global_costmap:
+      ros__parameters:
+        use_sim_time: true
+        update_frequency: 1.0
+        publish_frequency: 1.0
+        global_frame: map
+        robot_base_frame: robot1_base_footprint
+        robot_radius: 0.12
+        resolution: 0.05
+        track_unknown_space: false
+        transform_tolerance: 0.5
+        plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+        always_send_full_costmap: true
+        static_layer:
+          plugin: "nav2_costmap_2d::StaticLayer"
+          map_subscribe_transient_local: true
+        inflation_layer:
+          plugin: "nav2_costmap_2d::InflationLayer"
+          cost_scaling_factor: 3.0
+          inflation_radius: 0.35
+        obstacle_layer:
+          plugin: "nav2_costmap_2d::ObstacleLayer"
+          enabled: true
+          observation_sources: scan
+          scan:
+            topic: /robot1/scan
+            max_obstacle_height: 2.0
+            clearing: true
+            marking: true
+            data_type: "LaserScan"
+            raytrace_max_range: 3.0
+            raytrace_min_range: 0.0
+            obstacle_max_range: 2.5
+            obstacle_min_range: 0.0
+
+  planner_server:
+    ros__parameters:
+      use_sim_time: true
+      expected_planner_frequency: 5.0
+      planner_plugins: ["GridBased"]
+      costmap_update_timeout: 1.0
+      GridBased:
+        plugin: "nav2_navfn_planner::NavfnPlanner"
+        tolerance: 0.5
+        use_astar: true          # 场地小、有隔断，A* 比 Dijkstra 更快
+        allow_unknown: false
+
+  behavior_server:
+    ros__parameters:
+      use_sim_time: true
+      # 同 controller_server：恢复动作也走标准 Twist
+      enable_stamped_cmd_vel: false
+      cycle_frequency: 10.0
+      behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+      local_costmap_topic: local_costmap/costmap_raw
+      global_costmap_topic: global_costmap/costmap_raw
+      local_footprint_topic: local_costmap/published_footprint
+      global_footprint_topic: global_costmap/published_footprint
+      spin:
+        plugin: "nav2_behaviors::Spin"
+      backup:
+        plugin: "nav2_behaviors::BackUp"
+        acceleration_limit: 1.0
+        deceleration_limit: -1.0
+        minimum_speed: 0.05
+      drive_on_heading:
+        plugin: "nav2_behaviors::DriveOnHeading"
+        acceleration_limit: 1.0
+        deceleration_limit: -1.0
+        minimum_speed: 0.05
+      wait:
+        plugin: "nav2_behaviors::Wait"
+      local_frame: robot1_odom
+      global_frame: map
+      robot_base_frame: robot1_base_footprint
+      transform_tolerance: 0.3
+      simulate_ahead_time: 2.0
+      max_rotational_vel: 0.8
+      min_rotational_vel: 0.3
+      rotational_acc_lim: 2.0
+
+  bt_navigator:
+    ros__parameters:
+      use_sim_time: true
+      global_frame: map
+      robot_base_frame: robot1_base_footprint
+      odom_topic: odom            # 相对名 -> /robot1/odom
+      bt_loop_duration: 10
+      filter_duration: 0.3
+      default_server_timeout: 20
+      default_cancel_timeout: 50
+      wait_for_service_timeout: 1000
+      navigators: ["navigate_to_pose", "navigate_through_poses"]
+      navigate_to_pose:
+        plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+        enable_groot_monitoring: false
+      navigate_through_poses:
+        plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+        enable_groot_monitoring: false
+      # 不显式指定 bt_search_directories：默认值已指向
+      # nav2_bt_navigator/behavior_trees，写在这里反而需要 launch 期替换
+
+  # 生命周期管理器：按顺序拉起上面四个节点（costmap 是它们的子节点，自动跟随）
+  lifecycle_manager_navigation:
+    ros__parameters:
+      use_sim_time: true
+      autostart: true
+      node_names:
+        - controller_server
+        - planner_server
+        - behavior_server
+        - bt_navigator
+      bond_timeout: 4.0

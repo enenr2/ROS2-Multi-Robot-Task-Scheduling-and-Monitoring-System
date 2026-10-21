@@ -22,6 +22,7 @@ def generate_launch_description():
     urdf_file = os.path.join(bringup, 'urdf', 'turtlebot3_burger_fleet.urdf')
     rviz_config = os.path.join(bringup, 'config', 'fleet.rviz')
     map_yaml = os.path.join(bringup, 'maps', 'fleet_map.yaml')
+    nav2_params = os.path.join(bringup, 'config', 'nav2_robot1.yaml')
 
     with open(urdf_file, 'r') as f:
         urdf_text = f.read()
@@ -62,6 +63,8 @@ def generate_launch_description():
                               description='是否启动 gz GUI（VM 上建议 false）'),
         DeclareLaunchArgument('rviz', default_value='true',
                               description='是否启动 RViz2 集群可视化'),
+        DeclareLaunchArgument('nav2', default_value='true',
+                              description='是否为 robot1 启动 Nav2 导航栈'),
 
         # ① 物理服务端（-r 加载即运行）
         ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
@@ -124,8 +127,46 @@ def generate_launch_description():
                        '-x', x, '-y', y, '-z', '0.05'],
             output='screen'))
 
-    # ⑥ 集群可视化：RViz2 统一在 world 坐标系下显示两台车
-    # 延迟 6 秒启动：等 clock/TF/robot_description 就绪后再建视图，
+    # ⑥ Nav2 导航栈：只给 robot1 起（M2 阶段先跑通单机）
+    #
+    # 三处必须显式处理，否则多机 TF 场景下必挂：
+    #   1. tf / tf_static 强制指向全局话题。Nav2 官方 launch 把 '/tf' 重映射成
+    #      相对名 'tf'，在命名空间下会变成 /robot1/tf —— 但我们两台车共用
+    #      一棵 TF 树（帧名已带前缀），必须都读全局 /tf
+    #   2. map 指向全局地图。全局代价地图的静态层默认订阅相对 'map'，
+    #      在命名空间下会解析成 /robot1/map，而地图是全局共享的 /map
+    #   3. 帧名在 nav2_robot1.yaml 里已写成 robot1_xxx，与 TF 树一致
+    NAV2_NS = 'robot1'
+
+    def nav2_node(pkg, exe, node_name, extra_remaps=()):
+        return Node(
+            package=pkg, executable=exe, name=node_name,
+            namespace=NAV2_NS,
+            parameters=[nav2_params],
+            remappings=[('/tf', '/tf'), ('/tf_static', '/tf_static')] + list(extra_remaps),
+            condition=IfCondition(LaunchConfiguration('nav2')),
+            output='screen')
+
+    nav2_nodes = [
+        # 代价地图是 controller_server / planner_server 的子节点，
+        # 所以 map 的重映射挂在父节点上，子节点同进程生效。
+        # 注意必须写全限定名 '/robot1/map'：Nav2 把 map 解析成父命名空间下的
+        # /robot1/map，用相对名 'map' 作重映射源匹配不上（实测无效）
+        nav2_node('nav2_controller', 'controller_server', 'controller_server'),
+        nav2_node('nav2_planner', 'planner_server', 'planner_server',
+                  [('/robot1/map', '/map')]),
+        nav2_node('nav2_behaviors', 'behavior_server', 'behavior_server'),
+        nav2_node('nav2_bt_navigator', 'bt_navigator', 'bt_navigator'),
+        nav2_node('nav2_lifecycle_manager', 'lifecycle_manager',
+                  'lifecycle_manager_navigation'),
+    ]
+
+    # 延迟启动 Nav2：等 gz 出 clock、桥出 odom/scan、TF 树建起来之后再拉，
+    # 否则生命周期节点会因拿不到初始位姿而卡在 inactive
+    actions.append(TimerAction(period=10.0, actions=nav2_nodes))
+
+    # ⑦ 集群可视化：RViz2 统一在 map 坐标系下显示两台车
+    # 延迟启动：等 clock/TF/robot_description 就绪后再建视图，
     # 否则 RViz 会在 TF 缺席时初始化相机，视角会歪掉
     actions.append(TimerAction(
         period=6.0,
