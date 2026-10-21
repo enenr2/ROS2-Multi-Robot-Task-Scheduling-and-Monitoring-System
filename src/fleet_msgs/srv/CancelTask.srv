@@ -1,0 +1,5 @@
+string task_id
+string reason            # 取消原因，会写入 TaskStatus.failure_reason
+---
+bool canceled
+string message

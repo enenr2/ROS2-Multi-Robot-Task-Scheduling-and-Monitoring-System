@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fleet_bringup</name>
+  <version>0.0.0</version>
+  <description>多机器人集群仿真启动配置（world/models/bridge/launch）</description>
+  <maintainer email="enenr@todo.todo">enenr</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>ros_gz_sim</depend>
+  <depend>ros_gz_bridge</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>turtlebot3_gazebo</depend>
+  <depend>tf2_ros</depend>
+  <depend>rviz2</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

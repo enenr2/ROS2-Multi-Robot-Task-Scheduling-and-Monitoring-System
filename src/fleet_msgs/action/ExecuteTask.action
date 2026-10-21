@@ -1,0 +1,18 @@
+# 一次调用 = 一个任务的全部执行过程（调度器每车一个 client 直调，天然互斥）
+# Goal
+string task_id
+uint8 target_color
+geometry_msgs/Pose target_pose
+float32 standoff          # 期望停车距离（米），默认 0.6
+---
+# Result
+bool success
+string failure_reason     # 与 TaskStatus.failure_reason 同枚举
+float32 final_distance
+float32 final_heading_error
+---
+# Feedback
+uint8 state               # 复用 TaskStatus 的状态常量
+float32 distance_remaining
+float32 progress
+string detail

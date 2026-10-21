@@ -1,0 +1,7 @@
+# 外部/测试注入任务
+uint8 target_color
+geometry_msgs/Pose target_pose
+---
+bool accepted
+string task_id
+string message
