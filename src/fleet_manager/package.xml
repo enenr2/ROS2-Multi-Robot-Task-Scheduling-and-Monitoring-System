@@ -9,7 +9,12 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <!-- 业务逻辑层不依赖 rclcpp，只在 M6 接入的 ROS 适配层里才用到 -->
+  <!-- 业务逻辑库 fleet_core 不依赖 ROS；下面这些只服务于 ROS 适配层节点 -->
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>fleet_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -4,7 +4,7 @@
 
 不同于只展示 3D 模型的仿真项目，本仓库的重点在工程细节：多机命名空间隔离、TF 树统一、接口版本化、纯逻辑单测、故障注入与状态可观测。
 
-当前状态：**M0–M5 已完成并通过仿真验收**，M6–M9 开发中。
+当前状态：**M0–M6 已完成并通过仿真验收**，M7–M9 开发中。
 
 ---
 
@@ -51,7 +51,7 @@
 |---|---|---|---|
 | `fleet_msgs` | 接口层：4 个 msg、2 个 srv、1 个 action | 完成 | — |
 | `fleet_bringup` | 仿真底座：自建世界/地图/机器人模型、桥接配置、RViz、一键 launch | 完成 | — |
-| `fleet_manager` | 调度核心：状态机、任务队列、分配策略、看门狗（学员纯逻辑，不依赖 ROS） | 核心完成 | 54 gtest |
+| `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗 + ROS 适配节点（订阅/服务/action/Marker） | 完成 | 54 gtest |
 | `fleet_perception` | 感知：HSV 颜色识别、单目测距、时序去抖、TF 转世界系 | 完成 | 31 gtest |
 | `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳 | 完成 | 17 gtest |
 
@@ -97,7 +97,9 @@ source install/setup.bash
 ros2 launch fleet_bringup fleet_sim.launch.py gui:=false rviz:=true
 ```
 
-常用开关：`gui:=false|true`、`rviz:=false|true`、`nav2:=false|true`、`perception:=false|true`、`agent:=false|true`。
+常用开关：`gui:=false|true`、`rviz:=false|true`、`nav2:=false|true`、`perception:=false|true`、`agent:=false|true`、`manager:=false|true`。
+
+停仿真用 `./scripts/stop_sim.sh`：会 SIGTERM → 超时 SIGKILL，并清理 `/dev/shm/fastdds_*`。不要用 `pkill -f` 手工杀，卡在生命周期过渡的 Nav2 节点会忽略 SIGTERM 并残留成"同名僵尸节点"，下一次启动时生命周期管理器会卡住。
 
 逐项验收：
 
@@ -110,6 +112,9 @@ python3 src/fleet_perception/scripts/verify_perception.py
 
 # 执行：导航 → 对位 → 停车 + 并发拒绝 + 目标丢失
 python3 src/fleet_agent/scripts/verify_agent.py
+
+# 调度：自动发现 → 分配 → 执行 → 完成 + 服务注入/取消
+python3 src/fleet_manager/scripts/verify_manager.py
 ```
 
 > 反复 launch/kill 后若某台车的静态 TF 莫名消失（`/tf_static` 里看不到该车连杆），先清理 `/dev/shm/fastdds_*` 再启动 —— 这是 Fast DDS 共享内存段残留，不是代码问题。
@@ -141,6 +146,17 @@ python3 src/fleet_agent/scripts/verify_agent.py
 | 并发下发 | 第二个任务被立即拒绝 |
 | 对位中目标丢失 | 进入非成功终态，`failure_reason = TARGET_LOST` |
 
+**调度层**（M6）
+
+| 项目 | 结果 |
+|---|---|
+| 自动发现 | 目标进入视野后自动建单，无需人工注入 |
+| 分配 | 派给最近的允许派活车辆（robot1；robot2 无 Nav2 只监控） |
+| 状态链 | `PENDING → ASSIGNED → NAVIGATING → DOCKING → DONE` |
+| 停车精度 | 车到物块中心 0.82 m（期望约 0.73 m） |
+| 监控输出 | `/fleet/tasks` 快照 + `/fleet/task_markers` 持续发布 |
+| 服务 | `SubmitTask` 建单、重复提交被去重拒绝、`CancelTask` 中止执行中的任务并回到 IDLE |
+
 **导航层**（M2）
 
 | 项目 | 结果 |
@@ -162,7 +178,7 @@ fleet_ws/
 │   │   ├── models/robot1|2/ # 带相机与激光的 TurtleBot3
 │   │   ├── config/          # bridge.yaml / nav2_robot1.yaml / fleet.rviz
 │   │   └── launch/fleet_sim.launch.py
-│   ├── fleet_manager/       # 调度核心（纯逻辑，54 gtest）
+│   ├── fleet_manager/       # 调度核心（纯逻辑，54 gtest）+ ROS 适配节点（fleet_manager_node）
 │   ├── fleet_perception/    # 颜色 + 测距 + 去抖（31 gtest，含验收脚本）
 │   └── fleet_agent/         # 执行代理（17 gtest，含验收脚本）
 └── scripts/
@@ -191,9 +207,11 @@ fleet_ws/
 - tf2 禁止在回调里带超时查 TF（数据靠本节点执行器喂入，带超时等于自己等自己）；图像戳常比最新 TF 早/晚几毫秒，失败时退化为"最新位姿"
 - 颜色阈值必须限制饱和度下限，否则灰白墙面与地面会被误判
 
-**并发（执行代理）**
+**并发与进程管理**
 - action 服务端回调组必须用 `Reentrant` + 总线互斥标志，否则新任务请求会排在长时间 `execute` 后面、等前一任务结束才被处理
 - 终态只由 action result 承载：feedback 走话题、result 走服务响应，无顺序保证
+- Nav2 节点在生命周期过渡卡住时会忽略 SIGTERM，残留进程与下次启动形成同名节点，`lifecycle_manager` 会一直卡住；用 `scripts/stop_sim.sh` 做 SIGTERM→SIGKILL 清理
+- `bt_navigator` 默认只等 20 ms 连 `planner_server` 的 action server，节点刚激活时可能报 `compute_path_to_pose not available` 并拖垮整个 bringup，已把 `default_server_timeout` 提到 5000 ms
 
 ---
 
@@ -201,8 +219,9 @@ fleet_ws/
 
 - 相机在软件渲染下实际约 4 Hz，视觉对位限速 0.15 m/s；激光约 2.3 Hz
 - 感知每色只上报一个目标（当前场景三色各一块足够），偏轴测距会系统性偏小
-- 目前仅 robot1 接入 Nav2，robot2 作为可观测的第二个实例
-- 调度层尚未接入 ROS 适配（M6），监控端尚未开发（M8）
+- 目前仅 robot1 接入 Nav2，robot2 作为可观测的第二个实例（`dispatch_robot_ids` 控制派活范围）
+- 调度中心的超时是"兜底"：正常失败由 agent 先报，看门狗只处理 agent 失联的情况
+- 监控端尚未开发（M8），当前只能通过话题与 RViz 观察
 
 ---
 
@@ -216,7 +235,7 @@ fleet_ws/
 | M3 | 调度核心逻辑与 54 个单测 | 完成 |
 | M4 | 感知层（颜色识别 + 单目测距 + 去抖） | 完成 |
 | M5 | 执行代理（Nav2 封装 + 视觉精对位 + 心跳） | 完成 |
-| M6 | `fleet_manager` ROS 适配：队列/分配/超时重试接 action，RViz Marker | 进行中 |
+| M6 | `fleet_manager` ROS 适配：队列/分配/超时重试接 action，服务与 RViz Marker | 完成 |
 | M7 | 故障注入：目标丢失、导航失败、机器人离线、任务超时、重新分配 | 计划 |
 | M8 | Qt6 监控端：任务列表、机器人在线状态、告警、日志、相机流、rosbag 时间轴检索 | 计划 |
 | M9 | 集成测试、rosbag 回放、Docker、CI、完整交付文档 | 计划 |

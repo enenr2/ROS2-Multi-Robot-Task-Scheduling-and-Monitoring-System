@@ -69,6 +69,8 @@ def generate_launch_description():
                               description='是否为每台车启动视觉感知节点'),
         DeclareLaunchArgument('agent', default_value='true',
                               description='是否为每台车启动执行代理（ExecuteTask action）'),
+        DeclareLaunchArgument('manager', default_value='true',
+                              description='是否启动调度中心（任务分配与监控）'),
 
         # ① 物理服务端（-r 加载即运行）
         ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
@@ -214,6 +216,24 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('agent')),
             output='screen'))
     actions.append(TimerAction(period=14.0, actions=agent_nodes))
+
+    # ⑥''' 调度中心：订阅各车感知与状态，按任务表分配并直调 execute_task。
+    # 放在代理之后起，保证第一拍分配时 action 服务端已就绪
+    actions.append(TimerAction(
+        period=18.0,
+        actions=[Node(
+            package='fleet_manager',
+            executable='fleet_manager_node',
+            name='fleet_manager',
+            parameters=[{
+                'robot_ids': [name for name, _x, _y in robots],
+                # 目前只有 robot1 接了 Nav2，robot2 只监控不派活
+                'dispatch_robot_ids': ['robot1'],
+                'standoff': 0.6,
+                'publish_markers': True,
+            }],
+            condition=IfCondition(LaunchConfiguration('manager')),
+            output='screen')]))
 
     # ⑦ 集群可视化：RViz2 统一在 map 坐标系下显示两台车
     # 延迟启动：等 clock/TF/robot_description 就绪后再建视图，
