@@ -238,6 +238,11 @@ std::vector<Event> MonitorModel::OnTaskSnapshot(const TaskView& task, int64_t no
   } else {
     stored.first_seen_ms = it->second.first_seen_ms;
   }
+  if (IsTerminalState(stored.state)) {
+    stored.terminal_ms = (!is_new && it->second.terminal_ms > 0) ? it->second.terminal_ms : now_ms;
+  } else {
+    stored.terminal_ms = 0;
+  }
   tasks_[task.task_id] = stored;
 
   if (is_new) {
@@ -351,6 +356,13 @@ std::vector<Event> MonitorModel::OnTaskStatus(const StatusEvent& status, int64_t
   const auto it = tasks_.find(status.task_id);
   if (it != tasks_.end()) {
     it->second.state = status.state;
+    if (IsTerminalState(status.state)) {
+      if (it->second.terminal_ms == 0) {
+        it->second.terminal_ms = now_ms;
+      }
+    } else {
+      it->second.terminal_ms = 0;
+    }
     if (!status.robot_id.empty()) {
       it->second.robot = status.robot_id;
     }
@@ -395,6 +407,40 @@ std::vector<Event> MonitorModel::Sweep(int64_t now_ms)
     out.push_back(ev);
   }
   return out;
+}
+
+std::size_t MonitorModel::PruneTasks(int64_t now_ms, std::size_t max_terminal, int64_t keep_ms)
+{
+  std::vector<std::pair<int64_t, std::string>> terminals;
+  std::vector<std::string> drop;
+
+  for (const auto& [id, task] : tasks_) {
+    if (!IsTerminalState(task.state)) {
+      continue;   // 活跃/待分配任务永不清理
+    }
+    if (keep_ms > 0 && task.terminal_ms > 0 && now_ms - task.terminal_ms > keep_ms) {
+      drop.push_back(id);   // 太旧
+    } else {
+      terminals.emplace_back(task.terminal_ms, id);
+    }
+  }
+
+  if (terminals.size() > max_terminal) {
+    std::sort(terminals.begin(), terminals.end());
+    const std::size_t count = terminals.size() - max_terminal;
+    for (std::size_t i = 0; i < count; ++i) {
+      drop.push_back(terminals[i].second);
+    }
+  }
+
+  for (const auto& id : drop) {
+    tasks_.erase(id);
+    last_state_.erase(id);
+    progress_.erase(id);
+    detail_.erase(id);
+    retry_.erase(id);
+  }
+  return drop.size();
 }
 
 std::vector<TaskView> MonitorModel::SortedTasks() const

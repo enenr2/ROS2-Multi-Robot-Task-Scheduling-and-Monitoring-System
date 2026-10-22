@@ -77,13 +77,112 @@ TEST(TaskQueue, DifferentColorSamePlaceIsNotDuplicate)
   EXPECT_EQ(q.Size(), 2u);
 }
 
-TEST(TaskQueue, CanceledTaskAllowsRediscovery)
+TEST(TaskQueue, CanceledTaskBlocksUntilPruned)
+{
+  TaskQueueConfig cfg;
+  cfg.retention_age = 10 * kSecond;
+  TaskQueue q(cfg);
+  ASSERT_TRUE(q.AddTask("t1", Color::kRed, P(1.0, 1.0), kT0));
+  ASSERT_TRUE(q.Cancel("t1", kT0, "CANCELED_BY_OPERATOR"));
+
+  // 静止物块会持续被感知上报：保留期内必须挡住，否则取消后立刻又建单
+  EXPECT_FALSE(q.AddTask("t2", Color::kRed, P(1.0, 1.0), kT0));
+
+  // 保留期过后被清理，才允许重新建单
+  ASSERT_EQ(q.Prune(kT0 + 11 * kSecond).size(), 1u);
+  EXPECT_TRUE(q.AddTask("t2", Color::kRed, P(1.0, 1.0), kT0 + 12 * kSecond));
+}
+
+TEST(TaskQueue, MovedTargetCanBeRetaskedWithoutPrune)
 {
   TaskQueue q;
   ASSERT_TRUE(q.AddTask("t1", Color::kRed, P(1.0, 1.0), kT0));
+  ASSERT_TRUE(q.AssignTo("t1", "robot1", kT0));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kNavigating, kT0));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kDocking, kT0));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kDone, kT0));
+
+  // 同位置：视为同一物块，不重复建单
+  EXPECT_FALSE(q.AddTask("t2", Color::kRed, P(1.0, 1.0), kT0));
+  // 物块被挪到 1m 外（超过 0.8m 去重半径）：可以建新任务
+  EXPECT_TRUE(q.AddTask("t3", Color::kRed, P(2.0, 1.0), kT0));
+}
+
+TEST(TaskQueue, FinishedAtTrackedAndResetOnRetry)
+{
+  TaskQueue q;
+  ASSERT_TRUE(q.AddTask("t1", Color::kRed, P(0.0, 0.0), kT0));
+  ASSERT_TRUE(q.AssignTo("t1", "robot1", kT0));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kNavigating, kT0));
+
+  ASSERT_TRUE(q.RetryOrFail("t1", kT0 + kSecond, "NAV_TIMEOUT"));
+  EXPECT_EQ(q.Find("t1")->finished_at, 0) << "重排回 PENDING 后不再算终态";
+
+  ASSERT_TRUE(q.AssignTo("t1", "robot1", kT0 + 2 * kSecond));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kNavigating, kT0 + 2 * kSecond));
+  ASSERT_FALSE(q.RetryOrFail("t1", kT0 + 3 * kSecond, "NAV_TIMEOUT"));
+  EXPECT_EQ(q.Find("t1")->state, TaskState::kFailed);
+  EXPECT_EQ(q.Find("t1")->finished_at, kT0 + 3 * kSecond);
+}
+
+TEST(TaskQueue, PruneRemovesOldTerminalTasks)
+{
+  TaskQueueConfig cfg;
+  cfg.retention_age = 10 * kSecond;
+  cfg.max_terminal = 100;
+  TaskQueue q(cfg);
+
+  ASSERT_TRUE(q.AddTask("t1", Color::kRed, P(0.0, 0.0), kT0));
   ASSERT_TRUE(q.Cancel("t1", kT0, "CANCELED_BY_OPERATOR"));
-  // 人工取消后，同一物块应能被重新发现建任务
-  EXPECT_TRUE(q.AddTask("t2", Color::kRed, P(1.0, 1.0), kT0));
+  ASSERT_TRUE(q.AddTask("t2", Color::kGreen, P(1.0, 0.0), kT0));
+  ASSERT_TRUE(q.Cancel("t2", kT0 + 5 * kSecond, "CANCELED_BY_OPERATOR"));
+
+  EXPECT_TRUE(q.Prune(kT0 + 8 * kSecond).empty()) << "都还没过期";
+  const auto removed = q.Prune(kT0 + 12 * kSecond);
+  ASSERT_EQ(removed.size(), 1u);
+  EXPECT_EQ(removed[0], "t1");
+  EXPECT_EQ(q.Find("t1"), nullptr);
+  EXPECT_NE(q.Find("t2"), nullptr) << "t2 只过了 7s，仍在保留期";
+}
+
+TEST(TaskQueue, PruneKeepsNewestTerminalTasks)
+{
+  TaskQueueConfig cfg;
+  cfg.retention_age = 0;   // 关闭按时间清理，只验证数量上限
+  cfg.max_terminal = 2;
+  TaskQueue q(cfg);
+
+  for (int i = 1; i <= 4; ++i) {
+    const std::string id = "t" + std::to_string(i);
+    ASSERT_TRUE(q.AddTask(id, Color::kRed, P(static_cast<double>(i), 0.0), kT0));
+    ASSERT_TRUE(q.Cancel(id, kT0 + i * kSecond, "CANCELED_BY_OPERATOR"));
+  }
+
+  const auto removed = q.Prune(kT0 + 10 * kSecond);
+  EXPECT_EQ(removed.size(), 2u);
+  EXPECT_EQ(q.Find("t1"), nullptr);
+  EXPECT_EQ(q.Find("t2"), nullptr);
+  EXPECT_NE(q.Find("t3"), nullptr);
+  EXPECT_NE(q.Find("t4"), nullptr) << "保留最新的两个";
+}
+
+TEST(TaskQueue, PruneNeverRemovesActiveTasks)
+{
+  TaskQueueConfig cfg;
+  cfg.retention_age = kSecond;   // 极短，活跃任务也不能被清掉
+  cfg.max_terminal = 1;
+  TaskQueue q(cfg);
+
+  ASSERT_TRUE(q.AddTask("active", Color::kRed, P(0.0, 0.0), kT0));
+  ASSERT_TRUE(q.AssignTo("active", "robot1", kT0));
+  ASSERT_TRUE(q.AddTask("done1", Color::kGreen, P(1.0, 0.0), kT0));
+  ASSERT_TRUE(q.Cancel("done1", kT0, "CANCELED_BY_OPERATOR"));
+  ASSERT_TRUE(q.AddTask("done2", Color::kBlue, P(2.0, 0.0), kT0));
+  ASSERT_TRUE(q.Cancel("done2", kT0, "CANCELED_BY_OPERATOR"));
+
+  const auto removed = q.Prune(kT0 + 10 * kSecond);
+  EXPECT_EQ(removed.size(), 2u);
+  EXPECT_NE(q.Find("active"), nullptr) << "活跃任务永不清理";
 }
 
 TEST(TaskQueue, RevisionIncrementsOnEveryChange)

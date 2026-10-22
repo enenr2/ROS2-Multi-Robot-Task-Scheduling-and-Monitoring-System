@@ -1,0 +1,81 @@
+name: Nightly sim smoke
+
+# 常规 CI 不跑 Gazebo；这里用单独的工作流做端到端冒烟，
+# 防止桥接 / TF / AMCL / Nav2 / 感知的组合退化。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * *'
+
+jobs:
+  smoke:
+    name: headless sim smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container:
+      image: ros:lyrical-ros-base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install simulation dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ros-${ROS_DISTRO}-navigation2 \
+            ros-${ROS_DISTRO}-nav2-bringup \
+            ros-${ROS_DISTRO}-nav2-msgs \
+            ros-${ROS_DISTRO}-ros-gz-sim \
+            ros-${ROS_DISTRO}-ros-gz-bridge \
+            ros-${ROS_DISTRO}-turtlebot3-gazebo \
+            ros-${ROS_DISTRO}-robot-state-publisher \
+            ros-${ROS_DISTRO}-cv-bridge \
+            ros-${ROS_DISTRO}-vision-opencv \
+            ros-${ROS_DISTRO}-image-transport \
+            ros-${ROS_DISTRO}-rosbag2 \
+            ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+            python3-colcon-common-extensions
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: Run headless smoke
+        shell: bash
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          source install/setup.bash
+
+          ros2 launch fleet_bringup fleet_sim.launch.py \
+            gui:=false rviz:=false monitor:=false > /tmp/sim.log 2>&1 &
+          SIM_PID=$!
+          trap 'kill -INT $SIM_PID 2>/dev/null || true' EXIT
+
+          ros2 bag record -o /tmp/smoke_bag --topics \
+            /fleet/tasks \
+            /robot1/robot_status /robot2/robot_status \
+            /robot1/task_status /robot2/task_status \
+            > /tmp/record.log 2>&1 &
+          BAG_PID=$!
+
+          set +e
+          python3 scripts/smoke_sim.py --timeout 200 --boot-timeout 150
+          RC=$?
+          set -e
+
+          kill -INT $BAG_PID 2>/dev/null || true
+          sleep 5
+          exit $RC
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-smoke-diagnostics
+          path: |
+            /tmp/sim.log
+            /tmp/record.log
+            /tmp/smoke_bag
+          if-no-files-found: ignore

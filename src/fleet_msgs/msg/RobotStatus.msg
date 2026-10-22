@@ -11,6 +11,7 @@ geometry_msgs/Pose pose      # 平面位姿：z / roll / pitch 恒为 0
 string current_task          # 空字符串表示无任务
 uint16 tasks_done
 uint16 tasks_failed
+uint16 tasks_canceled    # 被取消的任务不计入 failed，单独统计
 uint32 heartbeat_seq         # 递增序号，用于区分丢包与停顿
 
 builtin_interfaces/Time stamp

@@ -80,7 +80,7 @@ private:
   // ---- 配置 ----
   double standoff_{0.6};
   bool publish_markers_{true};
-  // 只有这些车会接任务：robot2 目前没有 Nav2，只作为可观测实例
+  // 只有这些车会接任务（dispatch_robot_ids 控制；两车都接 Nav2，默认都可派）
   std::vector<std::string> dispatch_ids_;
   // 失败冷却：刚失败的车短时间内不再接单，否则重试会被"最近优先"又派回同一台
   TimeNs cooldown_ns_{10 * kSecond};

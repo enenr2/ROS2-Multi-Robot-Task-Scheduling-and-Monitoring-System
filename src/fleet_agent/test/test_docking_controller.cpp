@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include "fleet_agent/agent_geometry.hpp"
 #include "fleet_agent/docking_controller.hpp"
 
@@ -39,6 +41,26 @@ DockingInput Visible(double bearing, double range)
 }
 
 }  // namespace
+
+// ---------------- 任务级 standoff ----------------
+
+TEST(AgentGeometry, ResolveStandoffFallsBackAndClamps)
+{
+  // goal 未指定（0/负数/NaN）时用机器人默认值
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(0.0, 0.6), 0.6);
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(-0.3, 0.6), 0.6);
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(std::nan(""), 0.6), 0.6);
+
+  // 任务级配置优先
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(0.4, 0.6), 0.4);
+
+  // 越界收紧
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(9.0, 0.6), fleet::kMaxStandoff);
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(0.01, 0.6), fleet::kMinStandoff);
+
+  // 默认值本身越界也要收
+  EXPECT_DOUBLE_EQ(fleet::ResolveStandoff(0.0, 5.0), fleet::kMaxStandoff);
+}
 
 // ---------------- 接近点 ----------------
 

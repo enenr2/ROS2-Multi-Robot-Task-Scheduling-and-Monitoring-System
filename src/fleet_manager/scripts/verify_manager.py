@@ -6,7 +6,7 @@
 
 判定项：
   1. 目标出现后调度自动建任务（无需 SubmitTask）
-  2. 任务分配给最近的、允许派活的车（robot1；robot2 没有 Nav2，只监控）
+  2. 任务分配给最近的、允许派活的车（默认两台车都可派）
   3. 任务走完 ASSIGNED -> NAVIGATING -> DOCKING -> DONE
   4. 执行结束后 robot1 停在物块前 0.6 m 左右
   5. 任务快照发布到 /fleet/tasks，RViz Marker 有输出

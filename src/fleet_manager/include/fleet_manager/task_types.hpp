@@ -18,6 +18,11 @@ using TimeNs = int64_t;
 inline constexpr TimeNs kSecond = 1000000000LL;
 inline constexpr TimeNs kMilliSecond = 1000000LL;
 
+// 停车距离的允许范围（调度端与 agent 端共用）：太近会顶到物块，
+// 太远则目标在相机里太小、单目测距误差放大
+inline constexpr double kMinStandoff = 0.25;
+inline constexpr double kMaxStandoff = 2.0;
+
 // 与 fleet_msgs/Detection 的颜色常量保持一致（1=红 2=绿 3=蓝）
 enum class Color : uint8_t {
   kUnknown = 0,
@@ -72,6 +77,8 @@ struct Task {
   TimeNs assigned_at{0};
 
   TimeNs detected_at{0};
+  // 进入终态的时间；重排回 PENDING 时清零。用于终态任务的保留/清理策略
+  TimeNs finished_at{0};
   uint8_t retry_count{0};
   uint8_t max_retries{1};
 

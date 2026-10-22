@@ -21,6 +21,10 @@ struct TaskQueueConfig {
   // 看到同一物块后各建一个任务。
   double dedup_radius{0.5};
   uint8_t default_max_retries{1};
+  // 终态任务保留策略：活跃任务永不清理；终态任务超过 age 或数量上限就删除。
+  // 不清理会让去重误伤"同色目标再次出现"，内存与监控快照也会无限增长。
+  TimeNs retention_age{600 * kSecond};
+  std::size_t max_terminal{500};
 };
 
 class TaskQueue
@@ -60,6 +64,14 @@ public:
   std::vector<Pose2D> ActiveTargets() const;
 
   std::size_t Size() const { return tasks_.size(); }
+
+  // 运行时参数化（manager 声明完参数后覆盖默认配置）
+  void set_config(const TaskQueueConfig& cfg) { cfg_ = cfg; }
+  const TaskQueueConfig& config() const { return cfg_; }
+
+  // 清理超过保留策略的终态任务，返回被删除的 id。
+  // 活跃任务永不清理；终态任务保留最近 max_terminal 个、且不超过 retention_age。
+  std::vector<TaskId> Prune(TimeNs now);
 
 private:
   TaskQueueConfig cfg_;

@@ -7,6 +7,7 @@
 // 用注入时间戳的单测覆盖这些点，比开仿真点鼠标快得多。
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -54,6 +55,8 @@ struct TaskView
   // 监控端第一次看到该任务的时间（本端时钟）。仿真里 detected_at 是 sim time，
   // 与界面上的墙钟日志不同源，表格统一用这个字段展示
   int64_t first_seen_ms = 0;
+  // 进入终态的本端时间；用于清理历史任务，避免表格与内存无限增长
+  int64_t terminal_ms = 0;
   uint64_t revision = 0;
 };
 
@@ -68,6 +71,7 @@ struct RobotView
   std::string current_task;
   int tasks_done = 0;
   int tasks_failed = 0;
+  int tasks_canceled = 0;
   uint32_t heartbeat_seq = 0;
   int64_t last_seen_ms = 0;   // 本端收到心跳的本地时间
   bool online = false;        // 由 MonitorModel 按心跳间隔判定
@@ -133,6 +137,10 @@ public:
   std::vector<Event> EnsureRobot(const std::string& robot_id, int64_t now_ms);
   // 周期调用：把心跳超时的车标离线。返回"刚判定离线"的事件
   std::vector<Event> Sweep(int64_t now_ms);
+  // 清理过期的终态任务：保留最近 max_terminal 个，且不超过 keep_ms。
+  // 只删终态，活跃任务永远保留。返回删除条数。
+  std::size_t PruneTasks(int64_t now_ms, std::size_t max_terminal = 300,
+                         int64_t keep_ms = 600000);
 
   void Clear();
 

@@ -33,6 +33,7 @@
 #include <thread>
 
 #include "fleet_agent/agent_geometry.hpp"
+#include "fleet_agent/cmd_vel_link.hpp"
 #include "fleet_agent/docking_controller.hpp"
 #include "fleet_manager/task_types.hpp"
 #include "fleet_msgs/action/execute_task.hpp"
@@ -104,13 +105,13 @@ public:
     }
 
     world_frame_ = declare_parameter<std::string>("world_frame", "map");
-    const double standoff = declare_parameter<double>("standoff", 0.6);
-    approach_distance_ = standoff + declare_parameter<double>("pre_dock_margin", 0.8);
+    standoff_default_ = ResolveStandoff(0.0, declare_parameter<double>("standoff", 0.6));
+    pre_dock_margin_ = declare_parameter<double>("pre_dock_margin", 0.8);
     nav_timeout_s_ = declare_parameter<double>("nav_timeout", 90.0);
     const auto detection_stale_ms = declare_parameter<int>("detection_stale_ms", 1000);
 
     DockingConfig dock_cfg;
-    dock_cfg.standoff = standoff;
+    dock_cfg.standoff = standoff_default_;
     dock_cfg.distance_tolerance = declare_parameter<double>("distance_tolerance", 0.10);
     dock_cfg.bearing_tolerance = declare_parameter<double>("bearing_tolerance", 0.05);
     dock_cfg.max_linear_vel = declare_parameter<double>("max_linear_vel", 0.15);
@@ -136,7 +137,18 @@ public:
       "detections", rclcpp::QoS(20),
       [this](fleet_msgs::msg::Detection::SharedPtr msg) { OnDetection(*msg); }, opts);
 
-    cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", rclcpp::QoS(10));
+    // cmd_vel 是安全通道：可靠 QoS + KeepLast(1)，停车由 CmdVelLink 统一发多帧零速。
+    // 不用 best effort —— 丢一帧"停车"的代价远大于多收一帧旧速度。
+    cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(
+      "cmd_vel", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+    cmd_link_ = std::make_unique<CmdVelLink>(
+      [this](double linear, double angular) {
+        geometry_msgs::msg::Twist cmd;
+        cmd.linear.x = linear;
+        cmd.angular.z = angular;
+        cmd_pub_->publish(cmd);
+      },
+      StopPolicy{3});
     task_status_pub_ = create_publisher<fleet_msgs::msg::TaskStatus>(
       "task_status", rclcpp::QoS(20));
     robot_status_pub_ = create_publisher<fleet_msgs::msg::RobotStatus>(
@@ -165,10 +177,24 @@ public:
       std::chrono::seconds(1), [this]() { PublishRobotStatus(); }, sensor_group_);
 
     RCLCPP_INFO(get_logger(),
-                "执行代理就绪: robot=%s 对位停车距离=%.2fm 导航终点退让=%.2fm "
+                "执行代理就绪: robot=%s 默认对位距离=%.2fm 导航终点退让=%.2fm "
                 "action=/%s/execute_task",
-                robot_id_.c_str(), dock_->config().standoff, approach_distance_,
+                robot_id_.c_str(), standoff_default_, standoff_default_ + pre_dock_margin_,
                 robot_id_.c_str());
+  }
+
+  ~RobotAgent() override
+  {
+    SafeStop();
+  }
+
+  // 退出前显式停车：main 在 rclcpp::shutdown() 之前调用
+  void SafeStop()
+  {
+    if (!rclcpp::ok() || cmd_link_ == nullptr) {
+      return;
+    }
+    cmd_link_->Stop();
   }
 
 private:
@@ -236,7 +262,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!has_pose_) {
-        Finish(handle, result, false, kReasonUnreachable, "收不到里程计，无法定位");
+        Finish(handle, result, Outcome::kFailed, kReasonUnreachable, "收不到里程计，无法定位");
         return;
       }
       robot_pose = pose_;
@@ -247,11 +273,27 @@ private:
     target.y = goal->target_pose.position.y;
     target.yaw = YawFromQuaternion(goal->target_pose.orientation);
 
-    const ApproachResult approach = ComputeApproach(robot_pose, target, approach_distance_);
+    // 任务级 standoff：调度端的 goal 字段优先，缺省回退到本机默认值。
+    // 之前只用启动参数，导致 manager 改 standoff 实际不生效。
+    const double standoff = ResolveStandoff(goal->standoff, standoff_default_);
+    if (goal->standoff > 0.0 && std::abs(goal->standoff - standoff) > 1e-6) {
+      RCLCPP_WARN(get_logger(), "任务 %s 请求 standoff=%.2fm，已限制到 %.2fm",
+                  task_id_.c_str(), goal->standoff, standoff);
+    }
+    if (std::abs(dock_->config().standoff - standoff) > 1e-9) {
+      DockingConfig cfg = dock_->config();
+      cfg.standoff = standoff;
+      dock_->set_config(cfg);
+      RCLCPP_INFO(get_logger(), "任务 %s 使用任务级 standoff=%.2fm",
+                  task_id_.c_str(), standoff);
+    }
+    const double approach_distance = standoff + pre_dock_margin_;
+
+    const ApproachResult approach = ComputeApproach(robot_pose, target, approach_distance);
 
     if (!approach.already_close) {
-      if (!Navigate(handle, approach)) {
-        Finish(handle, result, false, failure_reason_, failure_detail_);
+      if (!Navigate(handle, approach, approach_distance)) {
+        Finish(handle, result, OutcomeOf(failure_reason_), failure_reason_, failure_detail_);
         return;
       }
     } else {
@@ -262,13 +304,14 @@ private:
 
     const bool docked = Dock(handle, color, result);
     if (docked) {
-      Finish(handle, result, true, kReasonNone, "任务完成");
+      Finish(handle, result, Outcome::kSucceeded, kReasonNone, "任务完成");
     } else {
-      Finish(handle, result, false, failure_reason_, failure_detail_);
+      Finish(handle, result, OutcomeOf(failure_reason_), failure_reason_, failure_detail_);
     }
   }
 
-  bool Navigate(const std::shared_ptr<GoalHandleExecute>& handle, const ApproachResult& approach)
+  bool Navigate(const std::shared_ptr<GoalHandleExecute>& handle, const ApproachResult& approach,
+                double approach_distance)
   {
     if (!nav_client_->wait_for_action_server(std::chrono::seconds(5))) {
       failure_reason_ = kReasonUnreachable;
@@ -306,7 +349,7 @@ private:
 
     PublishTaskStatus(TaskState::kNavigating, 0.1, "导航前往目标附近");
 
-    const double start_distance = std::max(approach.distance_to_target - approach_distance_, 0.0);
+    const double start_distance = std::max(approach.distance_to_target - approach_distance, 0.0);
     const rclcpp::Time nav_start = now();
     auto result_future = nav_client_->async_get_result(nav_handle);
 
@@ -499,34 +542,62 @@ private:
 
   // ---------------- 收尾与发布 ----------------
 
+  // 三种终态必须分开：取消不是失败，action 语义、TaskStatus 与监控统计要一致
+  enum class Outcome { kSucceeded, kCanceled, kFailed };
+
+  static Outcome OutcomeOf(const std::string& reason)
+  {
+    return reason == kReasonCanceled ? Outcome::kCanceled : Outcome::kFailed;
+  }
+
   void Finish(const std::shared_ptr<GoalHandleExecute>& handle,
               const std::shared_ptr<ExecuteTask::Result>& result,
-              bool success, const std::string& reason, const std::string& detail)
+              Outcome outcome, const std::string& reason, const std::string& detail)
   {
-    StopRobot();
-    result->success = success;
-    result->failure_reason = reason;
-
-    // 收尾前的状态检查：若收到过取消请求，goal 已不在 executing，
-    // abort()/succeed() 会抛异常，这里先记录一笔便于定位
-    if (handle->is_canceling()) {
-      RCLCPP_WARN(get_logger(), "任务 %s 收尾时处于 canceling 状态", task_id_.c_str());
+    // 取消请求可能恰好赶在收尾前到达：此时 goal 已处于 canceling，
+    // 再调 succeed()/abort() 会抛异常，语义上也应记为取消
+    const bool canceling = handle->is_canceling();
+    if (canceling) {
+      outcome = Outcome::kCanceled;
     }
 
-    if (success) {
-      tasks_done_.fetch_add(1);
-      PublishTaskStatus(TaskState::kDone, 1.0, detail);
-      RCLCPP_INFO(get_logger(), "任务 %s 完成", task_id_.c_str());
-      // 终态不再发 feedback：feedback 走话题、result 走服务响应，两者没有顺序
-      // 保证，客户端拿到 result 就会停止处理反馈（实测会偶发丢掉 DONE 这一帧）。
-      // 终态由 action result 承载，这是 action 的语义约定。
-      handle->succeed(result);
-    } else {
-      tasks_failed_.fetch_add(1);
-      PublishTaskStatus(TaskState::kFailed, 0.0, detail, reason);
-      RCLCPP_WARN(get_logger(), "任务 %s 失败: %s (%s)", task_id_.c_str(), reason.c_str(),
-                  detail.c_str());
-      handle->abort(result);
+    StopRobot();
+    result->success = outcome == Outcome::kSucceeded;
+    result->failure_reason = outcome == Outcome::kSucceeded ? kReasonNone
+                              : (outcome == Outcome::kCanceled ? kReasonCanceled : reason);
+
+    switch (outcome) {
+      case Outcome::kSucceeded:
+        tasks_done_.fetch_add(1);
+        PublishTaskStatus(TaskState::kDone, 1.0, detail);
+        RCLCPP_INFO(get_logger(), "任务 %s 完成", task_id_.c_str());
+        // 终态不再发 feedback：feedback 走话题、result 走服务响应，两者没有顺序
+        // 保证，客户端拿到 result 就会停止处理反馈（实测会偶发丢掉 DONE 这一帧）。
+        // 终态由 action result 承载，这是 action 的语义约定。
+        handle->succeed(result);
+        break;
+
+      case Outcome::kCanceled:
+        tasks_canceled_.fetch_add(1);
+        PublishTaskStatus(TaskState::kCanceled, 0.0,
+                          detail.empty() ? "任务被取消" : detail, kReasonCanceled);
+        RCLCPP_INFO(get_logger(), "任务 %s 已取消：%s", task_id_.c_str(),
+                    detail.empty() ? "操作员取消" : detail.c_str());
+        // 正常路径下 canceling 为真；若取消标记在手边丢了，至少不要抛异常
+        if (canceling) {
+          handle->canceled(result);
+        } else {
+          handle->abort(result);
+        }
+        break;
+
+      case Outcome::kFailed:
+        tasks_failed_.fetch_add(1);
+        PublishTaskStatus(TaskState::kFailed, 0.0, detail, reason);
+        RCLCPP_WARN(get_logger(), "任务 %s 失败: %s (%s)", task_id_.c_str(), reason.c_str(),
+                    detail.c_str());
+        handle->abort(result);
+        break;
     }
 
     task_id_.clear();
@@ -541,16 +612,16 @@ private:
 
   void StopRobot()
   {
-    PublishCmd(0.0, 0.0);
-    PublishCmd(0.0, 0.0);   // 发两帧：避免丢一帧后车还在动
+    if (cmd_link_ != nullptr) {
+      cmd_link_->Stop();
+    }
   }
 
   void PublishCmd(double linear, double angular)
   {
-    geometry_msgs::msg::Twist cmd;
-    cmd.linear.x = linear;
-    cmd.angular.z = angular;
-    cmd_pub_->publish(cmd);
+    if (cmd_link_ != nullptr) {
+      cmd_link_->Drive(linear, angular);
+    }
   }
 
   void PublishTaskStatus(TaskState state, float progress, const std::string& detail,
@@ -600,6 +671,7 @@ private:
     msg.current_task = current_task;
     msg.tasks_done = tasks_done_.load();
     msg.tasks_failed = tasks_failed_.load();
+    msg.tasks_canceled = tasks_canceled_.load();
     msg.heartbeat_seq = heartbeat_seq_++;
     msg.stamp = now();
     robot_status_pub_->publish(msg);
@@ -619,11 +691,13 @@ private:
 
   std::string robot_id_;
   std::string world_frame_;
-  double approach_distance_{1.4};
+  double standoff_default_{0.6};
+  double pre_dock_margin_{0.8};
   double nav_timeout_s_{90.0};
   double detection_stale_s_{1.0};
 
   std::unique_ptr<DockingController> dock_;
+  std::unique_ptr<CmdVelLink> cmd_link_;
 
   std::mutex mutex_;
   Pose2D pose_;
@@ -639,6 +713,7 @@ private:
   // 心跳线程要读，execute 线程要写，因此用原子量
   std::atomic<uint16_t> tasks_done_{0};
   std::atomic<uint16_t> tasks_failed_{0};
+  std::atomic<uint16_t> tasks_canceled_{0};
   uint32_t heartbeat_seq_{0};
 
   rclcpp::CallbackGroup::SharedPtr sensor_group_;
@@ -664,6 +739,7 @@ int main(int argc, char** argv)
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
   executor.add_node(node);
   executor.spin();
+  node->SafeStop();   // 退出前显式发零速，不能只依赖析构
   rclcpp::shutdown();
   return 0;
 }

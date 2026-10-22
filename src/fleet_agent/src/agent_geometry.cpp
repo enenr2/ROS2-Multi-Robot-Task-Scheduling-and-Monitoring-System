@@ -40,4 +40,13 @@ ApproachResult ComputeApproach(const Pose2D& robot, const Pose2D& target,
   return out;
 }
 
+double ResolveStandoff(double requested, double fallback)
+{
+  const double base = std::isfinite(requested) && requested > 0.0 ? requested : fallback;
+  if (!std::isfinite(base)) {
+    return 0.6;
+  }
+  return std::clamp(base, kMinStandoff, kMaxStandoff);
+}
+
 }  // namespace fleet

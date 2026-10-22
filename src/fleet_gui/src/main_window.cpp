@@ -243,7 +243,7 @@ void MainWindow::BuildUi()
   robot_table_ = MakeTable(
     {QStringLiteral("车辆"), QStringLiteral("状态"), QStringLiteral("位姿"),
      QStringLiteral("当前任务"), QStringLiteral("完成"), QStringLiteral("失败"),
-     QStringLiteral("心跳")},
+     QStringLiteral("取消"), QStringLiteral("心跳")},
     tabs);
 
   alarm_list_ = new QListWidget(tabs);
@@ -475,7 +475,10 @@ void MainWindow::OnTick()
   if (replay_active_) {
     return;
   }
-  ApplyLive(live_.Sweep(QDateTime::currentMSecsSinceEpoch()));
+  const int64_t now = QDateTime::currentMSecsSinceEpoch();
+  ApplyLive(live_.Sweep(now));
+  // 只保留最近的终态任务：快照会一直重发历史任务，界面不能无限增长
+  live_.PruneTasks(now);
   RefreshAll();
 }
 
@@ -622,6 +625,9 @@ void MainWindow::RefreshTables()
       robot_table_->setItem(row, 5,
                            MakeItem(QString::number(robot.tasks_failed),
                                     robot.tasks_failed > 0 ? kErrorColor : kDimText));
+      robot_table_->setItem(row, 6,
+                           MakeItem(QString::number(robot.tasks_canceled),
+                                    robot.tasks_canceled > 0 ? kWarnColor : kDimText));
 
       const QString heartbeat =
         robot.heartbeat_seen
@@ -634,7 +640,7 @@ void MainWindow::RefreshTables()
                    .arg(QString::fromStdString(
                      fleet::monitor::FormatAge(now - robot.last_seen_ms))))
           : QStringLiteral("从未收到");
-      robot_table_->setItem(row, 6, MakeItem(heartbeat, robot.online ? kDimText : kErrorColor));
+      robot_table_->setItem(row, 7, MakeItem(heartbeat, robot.online ? kDimText : kErrorColor));
       ++row;
     }
     robot_table_->verticalScrollBar()->setValue(scroll);
@@ -863,6 +869,7 @@ void MainWindow::ApplyReplayAt(int64_t stamp_ms)
     }
   }
   replay_.Sweep(replay_pos_ms_);
+  replay_.PruneTasks(replay_pos_ms_);
 
   RefreshAll();
   // 日志/告警每次全量重建，按 200ms 节流；拖动滑块（暂停态）时立即刷新

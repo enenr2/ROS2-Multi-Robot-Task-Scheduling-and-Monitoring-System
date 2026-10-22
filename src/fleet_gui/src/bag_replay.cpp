@@ -170,6 +170,7 @@ bool LoadBag(const std::string& uri, ReplayData* out, std::string* error)
         entry.robot.current_task = msg.current_task;
         entry.robot.tasks_done = msg.tasks_done;
         entry.robot.tasks_failed = msg.tasks_failed;
+        entry.robot.tasks_canceled = msg.tasks_canceled;
         entry.robot.heartbeat_seq = msg.heartbeat_seq;
       } else if (kind == "task_status") {
         fleet_msgs::msg::TaskStatus msg;

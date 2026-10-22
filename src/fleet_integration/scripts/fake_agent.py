@@ -37,10 +37,22 @@ class FakeAgent(Node):
         super().__init__('fake_agent')
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
+        # 测试用开关：hold_goals 让所有目标都停在执行中（等取消/超时）；
+        # status_after_result_ms 把终态 task_status 推迟到 action result 之后发
+        self.declare_parameter('hold_goals', False)
+        self.hold_goals = self.get_parameter('hold_goals').value
+        # 目标 x>100 视为"故意卡住"的开关，默认关闭；主测试套件打开它来验证取消
+        self.declare_parameter('hold_far_targets', False)
+        self.hold_far_targets = self.get_parameter('hold_far_targets').value
+        self.declare_parameter('status_after_result_ms', 0)
+        self.status_after_result_ms = self.get_parameter('status_after_result_ms').value
+        self.declare_parameter('pose_x', 1.0)
+        self.pose_x = self.get_parameter('pose_x').value
 
         self.busy = False
         self.current_task = ''
         self.tasks_done = 0
+        self.tasks_canceled = 0
         self.seq = 0
         self.mutex = threading.Lock()
         self.group = ReentrantCallbackGroup()
@@ -63,12 +75,13 @@ class FakeAgent(Node):
         msg = RobotStatus()
         msg.robot_id = self.robot_id
         msg.state = RobotStatus.STATE_BUSY if self.busy else RobotStatus.STATE_IDLE
-        msg.pose.position.x = 1.0
+        msg.pose.position.x = self.pose_x
         msg.pose.position.y = 0.0
         msg.pose.orientation.w = 1.0
         with self.mutex:
             msg.current_task = self.current_task
             msg.tasks_done = self.tasks_done
+            msg.tasks_canceled = self.tasks_canceled
             msg.heartbeat_seq = self.seq
             self.seq += 1
         msg.stamp = self.get_clock().now().to_msg()
@@ -97,7 +110,7 @@ class FakeAgent(Node):
 
         result = ExecuteTask.Result()
         try:
-            if goal.target_pose.position.x > 100.0:
+            if (self.hold_far_targets and goal.target_pose.position.x > 100.0) or self.hold_goals:
                 # 停在执行中，等调度层取消
                 self.publish_task_status(goal.task_id, STATE_NAVIGATING, 0.2, '等待取消')
                 deadline = time.time() + 20.0
@@ -107,6 +120,8 @@ class FakeAgent(Node):
                     goal_handle.canceled()
                     result.success = False
                     result.failure_reason = 'CANCELED_BY_OPERATOR'
+                    with self.mutex:
+                        self.tasks_canceled += 1
                     self.publish_task_status(goal.task_id, STATE_CANCELED, 0.0,
                                              '任务被取消', 'CANCELED_BY_OPERATOR')
                 else:
@@ -125,6 +140,8 @@ class FakeAgent(Node):
                     goal_handle.canceled()
                     result.success = False
                     result.failure_reason = 'CANCELED_BY_OPERATOR'
+                    with self.mutex:
+                        self.tasks_canceled += 1
                     self.publish_task_status(goal.task_id, STATE_CANCELED, 0.0,
                                              '任务被取消', 'CANCELED_BY_OPERATOR')
                     return result
@@ -142,7 +159,14 @@ class FakeAgent(Node):
             result.failure_reason = 'NONE'
             result.final_distance = 0.6
             result.final_heading_error = 0.0
-            self.publish_task_status(goal.task_id, STATE_DONE, 1.0, '任务完成')
+            if self.status_after_result_ms > 0:
+                # 故意让 action result 先到，验证调度端不依赖两者的顺序
+                threading.Timer(
+                    self.status_after_result_ms / 1000.0,
+                    self.publish_task_status,
+                    args=(goal.task_id, STATE_DONE, 1.0, '任务完成')).start()
+            else:
+                self.publish_task_status(goal.task_id, STATE_DONE, 1.0, '任务完成')
             with self.mutex:
                 self.tasks_done += 1
             return result

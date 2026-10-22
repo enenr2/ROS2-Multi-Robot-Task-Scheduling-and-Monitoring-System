@@ -49,6 +49,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_docking_controller test/test_docking_controller.cpp)
   target_link_libraries(test_docking_controller agent_core)
+
+  ament_add_gtest(test_cmd_vel_link test/test_cmd_vel_link.cpp)
+  target_link_libraries(test_cmd_vel_link agent_core)
 endif()
 
 install(TARGETS agent_core

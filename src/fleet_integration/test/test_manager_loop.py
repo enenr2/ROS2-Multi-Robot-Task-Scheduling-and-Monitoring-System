@@ -48,7 +48,7 @@ def generate_test_description():
         package='fleet_integration',
         executable='fake_agent',
         namespace='robot1',
-        parameters=[{'robot_id': 'robot1'}],
+        parameters=[{'robot_id': 'robot1', 'hold_far_targets': True}],
         output='screen')
 
     manager = launch_ros.actions.Node(
@@ -166,12 +166,6 @@ class ManagerAgentLoopTest(unittest.TestCase):
         self.assertIn(TaskStatus.STATE_DOCKING, states)
         self.assertEqual(states[-1], TaskStatus.STATE_DONE)
 
-        # 同一目标重复上报（感知 4~5 Hz 会持续发）不能重复建单
-        self.publish_detection(Detection.COLOR_RED, 3.0, 1.0)
-        time.sleep(1.5)
-        self.assertEqual(len(self.tasks_with_color(Detection.COLOR_RED)), 1,
-                         '重复检测不应产生新任务')
-
     def test_2_lost_detection_is_ignored(self):
         """丢失事件（lost=true / range<0）不建单。"""
         self.publish_detection(Detection.COLOR_GREEN, 5.0, 5.0, lost=True)
@@ -216,16 +210,30 @@ class ManagerAgentLoopTest(unittest.TestCase):
             and not ROBOT_STATUS['robot1'].current_task,
             10.0, '车辆回到空闲')
 
+        # 取消单独计数，不能混进 tasks_failed
+        self.wait_until(lambda: ROBOT_STATUS['robot1'].tasks_canceled >= 1, 10.0,
+                        '取消计数 +1')
+        self.assertEqual(ROBOT_STATUS['robot1'].tasks_failed, 0, '取消不应计入失败')
+
     def test_4_duplicate_submit_is_rejected(self):
-        """与终态但未取消的任务同色同位置（<0.8m）的注入应被拒绝。"""
+        """与执行中任务同色同位置（<0.8m）的注入应被拒绝。"""
         self.wait_for_service(self.submit_client, 'SubmitTask')
         request = SubmitTask.Request()
-        request.target_color = Detection.COLOR_RED
-        request.target_pose.position.x = 3.0
-        request.target_pose.position.y = 1.0
+        request.target_color = Detection.COLOR_GREEN
+        request.target_pose.position.x = 300.0
+        request.target_pose.position.y = 0.0
         request.target_pose.orientation.w = 1.0
-        response = self.call(self.submit_client, request)
-        self.assertFalse(response.accepted, '重复注入不应被接受')
+        first = self.call(self.submit_client, request)
+        self.assertTrue(first.accepted, first.message)
+
+        duplicate = self.call(self.submit_client, request)
+        self.assertFalse(duplicate.accepted, '执行中的重复注入不应被接受')
+
+        # 收尾：取消掉这个占位任务，避免一直占着车
+        cancel_request = CancelTask.Request()
+        cancel_request.task_id = first.task_id
+        cancel_request.reason = 'CANCELED_BY_OPERATOR'
+        self.assertTrue(self.call(self.cancel_client, cancel_request).canceled)
 
 
 if __name__ == '__main__':

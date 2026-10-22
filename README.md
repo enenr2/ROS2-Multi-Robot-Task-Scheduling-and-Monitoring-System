@@ -64,13 +64,13 @@
 |---|---|---|---|
 | `fleet_msgs` | 接口层：4 个 msg、2 个 srv、1 个 action | 完成 | — |
 | `fleet_bringup` | 仿真底座：自建世界/地图/机器人模型、双 Nav2 + 双 AMCL、桥接配置、RViz、一键 launch | 完成 | — |
-| `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗、失败冷却 + ROS 适配节点（订阅/服务/action/Marker） | 完成 | 49 gtest |
+| `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗、失败冷却、终态任务保留 + ROS 适配节点 | 完成 | 54 gtest |
 | `fleet_perception` | 感知：HSV 颜色识别、单目测距、时序去抖、TF 转世界系 | 完成 | 28 gtest |
-| `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳 | 完成 | 16 gtest |
-| `fleet_gui` | 监控台：任务/车辆/告警/日志、地图与相机、手动注入/取消、rosbag 时间轴回放 | 完成 | 13 gtest |
-| `fleet_integration` | 真调度中心 + 假执行代理的跨节点集成测试（launch_testing） | 完成 | 4 用例 |
+| `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳、安全停车 | 完成 | 21 gtest |
+| `fleet_gui` | 监控台：任务/车辆/告警/日志、地图与相机、手动注入/取消、rosbag 时间轴回放 | 完成 | 15 gtest |
+| `fleet_integration` | 真调度中心 + 假执行代理/假 Nav2 的跨节点集成测试（launch_testing） | 完成 | 8 用例 |
 
-合计 **110 项测试，0 失败**（106 个 gtest + 4 个集成用例，`colcon test` 全绿）。
+合计 **126 项测试，0 失败**（118 个 gtest + 8 个集成用例；CI 每次由 `scripts/test_summary.py` 生成汇总）。
 
 分层原则：**能脱离 ROS 的数学与状态逻辑一律做成纯 C++ 库**，用注入时间驱动单测；ROS 节点只做接线与消息转换。
 
@@ -84,6 +84,15 @@
 | msg | `Detection` | 视觉检测结果（map 系坐标、测距、不确定度、`lost` 事件标志） |
 | srv | `SubmitTask` / `CancelTask` | 外部注入与取消任务 |
 | action | `ExecuteTask` | 调度器每车直调，一次调用 = 一个任务全过程 |
+
+行为约定：
+
+- **取消是独立终态**：用户取消 → `CANCELED`，action `canceled()`、`task_status` 也发 `CANCELED`，
+  不计入 `tasks_failed`；`RobotStatus` 新增 `tasks_canceled` 单独统计
+- **standoff 是任务级参数**：`ExecuteTask.goal.standoff` 优先，缺省回退到 agent 启动参数，
+  统一收在 0.25~2.0 m
+- **终态任务保留策略**：默认保留 10 分钟 / 最多 500 条；保留期内参与去重（防止静止物块
+  被反复建单），清出保留期后才允许同一位置重新建单
 
 ---
 
@@ -165,6 +174,9 @@ colcon test --packages-select fleet_integration --event-handlers console_direct+
 colcon test --packages-select fleet_manager fleet_perception fleet_agent fleet_gui fleet_integration \
   --return-code-on-test-failure
 colcon test-result --all --verbose
+
+# 端到端冒烟（需要仿真已启动；nightly 工作流也跑这一条）
+python3 scripts/smoke_sim.py --timeout 200
 ```
 
 故障场景与预期（详细映射见 `scripts/fault_injector.py` 头部注释）：
@@ -245,7 +257,7 @@ colcon test-result --all --verbose
 | 任务表 | 12 个任务按 2 Hz 快照刷新，`revision` 去重、状态跳变去抖 |
 | 手动注入 | 颜色 + 坐标经 `/fleet/submit_task` 建单，成功/拒绝均有回显 |
 | rosbag 回放 | 88 s / 7 话题的 mcap：拖动时间轴、1/2/4/8 倍速播放正常 |
-| 单测 | `monitor_core` 11 gtest + `replay_core` 2 gtest（自写 bag 再读回） |
+| 单测 | `monitor_core` 13 gtest + `replay_core` 2 gtest（自写 bag 再读回） |
 
 ---
 
@@ -306,12 +318,12 @@ fleet_ws/
 │   │   ├── models/robot1|2/ # 带相机与激光的 TurtleBot3
 │   │   ├── config/          # bridge.yaml / nav2_robot1.yaml / fleet.rviz
 │   │   └── launch/fleet_sim.launch.py
-│   ├── fleet_manager/       # 调度核心（纯逻辑，49 gtest）+ ROS 适配节点（fleet_manager_node）
+│   ├── fleet_manager/       # 调度核心（纯逻辑，54 gtest）+ ROS 适配节点（fleet_manager_node）
 │   │   └── scripts/verify_faults.py   # 四类故障注入验收（A/B/C/D）
 │   ├── fleet_perception/    # 颜色 + 测距 + 去抖（28 gtest，含验收脚本）
-│   ├── fleet_agent/         # 执行代理（16 gtest，含验收脚本）
-│   ├── fleet_gui/           # 监控台（Qt6，monitor_core + replay_core 共 13 gtest）
-│   └── fleet_integration/   # 假 agent + launch_testing 集成测试（4 用例）
+│   ├── fleet_agent/         # 执行代理（21 gtest，含验收脚本）
+│   ├── fleet_gui/           # 监控台（Qt6，monitor_core + replay_core 共 15 gtest）
+│   └── fleet_integration/   # 假 agent / 假 Nav2 + launch_testing 集成测试（8 用例）
 ├── docker/                  # Dockerfile + entrypoint
 ├── .github/workflows/       # CI（构建/测试/镜像）
 ├── docs/                    # 设计文档、交付文档、监控台截图
@@ -367,6 +379,12 @@ fleet_ws/
 - CI 不跑 Gazebo：单测覆盖纯逻辑，跨节点链路用假 agent 覆盖；导航/对位/故障注入放在开发机按验收脚本执行
 - 回放自测需要真 bag，所以用 `rosbag2_cpp::SequentialWriter` 在临时目录造一个 sqlite3 包，再交给 `LoadBag` 读回
 
+**调度与执行（复审修复）**
+- "只对活跃任务去重"会形成**无限任务环**：物块静止、感知 4~5 Hz 持续上报，任务一 DONE 就被立刻重新建单（实测一分钟内建了 35 个任务）。保留期内的终态任务必须继续参与去重，靠保留策略清理后再重新建单
+- 取消不是失败：`Finish()` 必须分成功/取消/失败三态；goal 已处于 canceling 时再调 `succeed()`/`abort()` 会抛异常，终态要发 `CANCELED` 而不是 `FAILED`
+- `goal.standoff` 之前只写进了 action 但 agent 只读启动参数，属于"看起来可配、实际无效"；现在由 agent 在任务开始时覆盖并做范围校验
+- cmd_vel 是安全通道：可靠 QoS + KeepLast(1)，停车统一走 `CmdVelLink` 连发多帧零速；退出、取消、失败收尾都调用同一个 `Stop()`
+
 **感知**
 - tf2 禁止在回调里带超时查 TF（数据靠本节点执行器喂入，带超时等于自己等自己）；图像戳常比最新 TF 早/晚几毫秒，失败时退化为"最新位姿"
 - 颜色阈值必须限制饱和度下限，否则灰白墙面与地面会被误判
@@ -390,9 +408,12 @@ fleet_ws/
 - 回放把整包读进内存，适合分钟级 bag；小时级数据需要改成按时间 seek
 - 任务表/车辆表每 500 ms 全量重建，任务数上千时需要换成增量模型
 - Qt 端在软件渲染下验证；高 DPI 与超宽屏未做专门适配
-- 集成测试覆盖的是 manager ↔ agent 契约，不覆盖 Nav2 / 感知链路，后者靠开发机仿真验收
+- 集成测试覆盖的是 manager ↔ agent 契约，不覆盖 Nav2 / 感知链路，后者靠 nightly 冒烟与开发机仿真验收
+- 终态任务保留期内（默认 10 分钟）同一位置不会重复建单；需要重新巡检要么移动物块，要么等保留期过期
+- 历史任务归档依赖 rosbag 录制（`record_demo_bag.sh`），调度器只做内存保留与清理
+- cmd_vel 看门狗需要底盘驱动实现；agent 侧只保证停车命令、退出/取消/失败时发零速
 - Docker 镜像未在开发机实际构建（Docker Hub 不可达），仅在 CI 中构建验证
-- CI 不跑 Gazebo：3D 仿真慢且易受环境影响，仿真验收按交付文档手动执行
+- CI 不跑 Gazebo：3D 仿真慢且易受环境影响；nightly 工作流单独做 headless 冒烟
 
 ---
 

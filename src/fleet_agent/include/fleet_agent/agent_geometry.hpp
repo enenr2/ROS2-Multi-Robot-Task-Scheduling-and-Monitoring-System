@@ -22,4 +22,8 @@ struct ApproachResult {
 ApproachResult ComputeApproach(const Pose2D& robot, const Pose2D& target,
                                double approach_distance);
 
+// 任务级停车距离：goal.standoff > 0 时优先使用，否则回退到机器人默认值。
+// 统一收进 [kMinStandoff, kMaxStandoff]；非有限值（NaN/Inf）按"未指定"处理。
+double ResolveStandoff(double requested, double fallback);
+
 }  // namespace fleet

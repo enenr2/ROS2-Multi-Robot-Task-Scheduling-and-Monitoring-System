@@ -107,8 +107,22 @@ FleetManagerNode::FleetManagerNode()
     "robot_ids", std::vector<std::string>{"robot1", "robot2"});
   dispatch_ids_ = declare_parameter<std::vector<std::string>>(
     "dispatch_robot_ids", std::vector<std::string>{"robot1"});
-  standoff_ = declare_parameter<double>("standoff", 0.6);
+  const double requested_standoff = declare_parameter<double>("standoff", 0.6);
+  standoff_ = std::clamp(requested_standoff, kMinStandoff, kMaxStandoff);
+  if (std::abs(standoff_ - requested_standoff) > 1e-9) {
+    RCLCPP_WARN(get_logger(), "standoff 超出 [%.2f, %.2f]，已限制到 %.2f",
+                kMinStandoff, kMaxStandoff, standoff_);
+  }
   publish_markers_ = declare_parameter<bool>("publish_markers", true);
+
+  // 终态任务保留策略：不清理会让内存和监控快照无限增长，
+  // 也会让"同色目标再次出现"被历史任务挡住
+  TaskQueueConfig queue_cfg = queue_.config();
+  queue_cfg.retention_age = static_cast<TimeNs>(
+    declare_parameter<double>("retention_age", 600.0) * kSecond);
+  queue_cfg.max_terminal = static_cast<std::size_t>(
+    declare_parameter<int>("retention_max_tasks", 500));
+  queue_.set_config(queue_cfg);
 
   // 看门狗时限做成参数：正常运行时是兜底，故障注入/调参时可以在线缩短
   WatchdogConfig wd;
@@ -372,6 +386,10 @@ void FleetManagerNode::OnCancel(
 void FleetManagerNode::Tick()
 {
   const TimeNs now = NowNs();
+  const auto pruned = queue_.Prune(now);
+  if (!pruned.empty()) {
+    RCLCPP_INFO(get_logger(), "清理 %zu 个超过保留策略的终态任务", pruned.size());
+  }
   HandleWatchdog(now);
   AssignPending(now);
   PublishTaskSnapshot();
@@ -551,12 +569,11 @@ void FleetManagerNode::OnActionResult(const RobotId& robot, const TaskId& task_i
                                                    : kReasonAgentFailed;
     if (reason.empty() || reason == "NONE") {
       reason = kReasonAgentFailed;
-    MarkCooldown(robot);
     }
     const bool retried = queue_.RetryOrFail(task_id, now, reason);
     RCLCPP_WARN(get_logger(), "任务 %s 由 %s 执行失败(%s)，%s", task_id.c_str(),
                 robot.c_str(), reason.c_str(), retried ? "已重排" : "置为 FAILED");
-    MarkCooldown(robot);
+    MarkCooldown(robot);   // 只设一次：失败车冷却，避免重试又派回同一台
   }
   ReleaseRobot(robot);
 }

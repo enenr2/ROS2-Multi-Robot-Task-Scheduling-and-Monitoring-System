@@ -232,6 +232,34 @@ TEST(MonitorCore, RegisteredRobotWithoutHeartbeatStaysOffline)
   EXPECT_TRUE(model.robots().at("robot1").online);
 }
 
+TEST(MonitorCore, PruneTasksKeepsActiveAndNewestTerminal)
+{
+  MonitorModel model;
+  model.OnTaskSnapshot(MakeTask("T1", kStatePending, 1), 1000);
+  model.OnTaskSnapshot(MakeTask("T2", kStateDone, 1, "robot1"), 1000);
+  model.OnTaskSnapshot(MakeTask("T3", kStateFailed, 1, "robot1"), 2000);
+  model.OnTaskSnapshot(MakeTask("T4", kStateCanceled, 1, "robot1"), 3000);
+
+  // 最多保留 1 个终态：丢最早的 T2/T3，保留 T4；活跃的 T1 不动
+  EXPECT_EQ(model.PruneTasks(4000, 1, 1000000), 2u);
+  EXPECT_EQ(model.tasks().count("T1"), 1u);
+  EXPECT_EQ(model.tasks().count("T2"), 0u);
+  EXPECT_EQ(model.tasks().count("T3"), 0u);
+  EXPECT_EQ(model.tasks().count("T4"), 1u);
+}
+
+TEST(MonitorCore, PruneTasksDropsByAge)
+{
+  MonitorModel model;
+  model.OnTaskSnapshot(MakeTask("T1", kStateDone, 1, "robot1"), 1000);
+  model.OnTaskSnapshot(MakeTask("T2", kStatePending, 1), 1000);
+
+  // T1 在 1s 完成；到 3s 时已超过 1s 保留期
+  EXPECT_EQ(model.PruneTasks(3000, 100, 1000), 1u);
+  EXPECT_EQ(model.tasks().count("T1"), 0u);
+  EXPECT_EQ(model.tasks().count("T2"), 1u) << "待分配任务不能按 age 清理";
+}
+
 TEST(MonitorCore, TextHelpers)
 {
   EXPECT_EQ(StateName(kStateDocking), "对位中");

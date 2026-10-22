@@ -47,6 +47,7 @@ fleet::monitor::RobotView ToRobotView(const fleet_msgs::msg::RobotStatus& msg)
   view.current_task = msg.current_task;
   view.tasks_done = msg.tasks_done;
   view.tasks_failed = msg.tasks_failed;
+  view.tasks_canceled = msg.tasks_canceled;
   view.heartbeat_seq = msg.heartbeat_seq;
   return view;
 }
