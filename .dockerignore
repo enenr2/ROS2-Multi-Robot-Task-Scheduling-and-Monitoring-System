@@ -1,0 +1,11 @@
+.git
+.github
+.vscode
+build
+install
+log
+__pycache__
+*.pyc
+*.bag
+*.mcap
+docs/*.png

@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
-                            SetEnvironmentVariable, TimerAction)
+                            GroupAction, SetEnvironmentVariable, TimerAction)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetParameter
@@ -72,14 +72,20 @@ def generate_launch_description():
                               description='是否为每台车启动执行代理（ExecuteTask action）'),
         DeclareLaunchArgument('manager', default_value='true',
                               description='是否启动调度中心（任务分配与监控）'),
+        DeclareLaunchArgument('monitor', default_value='false',
+                              description='是否启动 Qt 监控台（fleet_gui）'),
 
         # ① 物理服务端（-r 加载即运行）
-        ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
-                       output='screen'),
         # ② 可选 GUI
-        ExecuteProcess(cmd=['gz', 'sim', '-g', '-v2'],
-                       condition=IfCondition(LaunchConfiguration('gui')),
-                       output='screen'),
+        # gz 的 Ogre 渲染在 vmwgfx 硬件路径下会频闪，整棵 gz 进程树单独切软件渲染
+        GroupAction([
+            SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1'),
+            ExecuteProcess(cmd=['gz', 'sim', '-r', '-s', '-v2', world_file],
+                           output='screen'),
+            ExecuteProcess(cmd=['gz', 'sim', '-g', '-v2'],
+                           condition=IfCondition(LaunchConfiguration('gui')),
+                           output='screen'),
+        ]),
         # ③ 桥：一张 yaml 管两台车的全部话题
         Node(package='ros_gz_bridge', executable='parameter_bridge',
              parameters=[{'config_file': bridge_yaml}],
@@ -254,12 +260,26 @@ def generate_launch_description():
     # 否则 RViz 会在 TF 缺席时初始化相机，视角会歪掉
     actions.append(TimerAction(
         period=6.0,
+        actions=[GroupAction([
+            # RViz2 的 Ogre 只支持 GLX，硬件渲染才不闪（与 gz 相反）
+            SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '0'),
+            Node(
+                package='rviz2',
+                executable='rviz2',
+                name='fleet_rviz',
+                arguments=['-d', rviz_config],
+                condition=IfCondition(LaunchConfiguration('rviz')),
+                output='screen'),
+        ])]))
+
+    # ⑧ 可选：Qt 监控台。比赛调中心晚 4s 起，启动时就能看到已有任务与心跳
+    actions.append(TimerAction(
+        period=34.0,
         actions=[Node(
-            package='rviz2',
-            executable='rviz2',
-            name='fleet_rviz',
-            arguments=['-d', rviz_config],
-            condition=IfCondition(LaunchConfiguration('rviz')),
+            package='fleet_gui',
+            executable='fleet_monitor',
+            name='fleet_monitor',
+            condition=IfCondition(LaunchConfiguration('monitor')),
             output='screen')]))
 
     return LaunchDescription(actions)

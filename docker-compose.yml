@@ -1,0 +1,37 @@
+# 本机演示：sim 无界面跑仿真；monitor 连宿主机的 X11 显示
+#
+#   docker compose build
+#   docker compose up -d sim       # 先起仿真（约 40s 后 Nav2 就绪）
+#   docker compose up monitor      # 起 GUI（需要图形会话）
+#
+# 真机/服务器部署时把 monitor 换成 --tab、--camera 等参数即可。
+services:
+  sim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: fleet-sim:latest
+    command: ["sim"]
+    network_mode: host
+    ipc: host
+    shm_size: "1gb"
+    environment:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      RCUTILS_LOGGING_BUFFERED_STREAM: "1"
+    stop_grace_period: 20s
+
+  monitor:
+    image: fleet-sim:latest
+    command: ["monitor"]
+    network_mode: host
+    ipc: host
+    depends_on:
+      - sim
+    environment:
+      DISPLAY: "${DISPLAY}"
+      XAUTHORITY: /root/.Xauthority
+      QT_X11_NO_MITSHM: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro

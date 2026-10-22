@@ -82,8 +82,14 @@ VIS_PKGS=(
   "ros-${ROS_DISTRO_NAME}-vision-opencv"
   "ros-${ROS_DISTRO_NAME}-image-transport"
 )
+# M8 监控端：Qt6 控件 + rosbag2 回放
+GUI_PKGS=(
+  "qt6-base-dev"
+  "ros-${ROS_DISTRO_NAME}-rosbag2"
+  "ros-${ROS_DISTRO_NAME}-rosbag2-storage-mcap"
+)
 
-for pkg in "${NAV2_PKGS[@]}" "${VIS_PKGS[@]}"; do
+for pkg in "${NAV2_PKGS[@]}" "${VIS_PKGS[@]}" "${GUI_PKGS[@]}"; do
   if dpkg -s "$pkg" >/dev/null 2>&1; then
     ok "$pkg 已安装，跳过"
   elif apt-get install -y "$pkg" >/dev/null 2>&1; then

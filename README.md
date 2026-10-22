@@ -1,10 +1,12 @@
 # ROS2 多机器人任务调度与监控系统
 
+[![CI](https://github.com/enenr2/ROS2-Multi-Robot-Task-Scheduling-and-Monitoring-System/actions/workflows/ci.yml/badge.svg)](https://github.com/enenr2/ROS2-Multi-Robot-Task-Scheduling-and-Monitoring-System/actions/workflows/ci.yml)
+
 两台 TurtleBot3 在 Gazebo 中自主作业：**视觉发现彩色目标 → 调度分配任务 → Nav2 导航到目标附近 → 视觉闭环精对位停车**，全过程通过话题与 action 可观测、可回放。
 
-不同于只展示 3D 模型的仿真项目，本仓库的重点在工程细节：多机命名空间隔离、TF 树统一、接口版本化、纯逻辑单测、故障注入与状态可观测。
+不同于只展示 3D 模型的仿真项目，本仓库的重点在工程细节：多机命名空间隔离、TF 树统一、接口版本化、纯逻辑单测、跨节点集成测试、故障注入与状态可观测。
 
-当前状态：**M0–M7 已完成并通过仿真验收**，M8–M9 开发中。
+当前状态：**M0–M9 已完成并通过仿真验收**。部署、运维与验收矩阵见 [交付文档](docs/交付文档.md)。
 
 ---
 
@@ -39,6 +41,15 @@
               （任务状态事件流）                     （1 Hz 心跳，判活用）
 
   调度层 fleet_manager ── /robotN/execute_task (action) ──▶ fleet_agent
+                                          │
+                                          ▼
+                          ┌───────────────────────────────┐
+                          │ 监控端 fleet_gui（M8，Qt6）    │
+                          │ /fleet/tasks + /robotN/心跳/状态│
+                          │ /map + /robotN/camera/image    │
+                          │ 注入/取消 ──▶ /fleet/*_task 服务│
+                          │ rosbag2 ──▶ 时间轴回放          │
+                          └───────────────────────────────┘
 ```
 
 任务执行三段式：**导航**（Nav2 负责全局路径与避障，终点退到目标前 1.4 m 并让车头对准目标）→ **对位**（视觉闭环把航向收进 0.05 rad、距离收到 standoff 0.6 m）→ **收尾**（停车、发终态）。
@@ -53,9 +64,13 @@
 |---|---|---|---|
 | `fleet_msgs` | 接口层：4 个 msg、2 个 srv、1 个 action | 完成 | — |
 | `fleet_bringup` | 仿真底座：自建世界/地图/机器人模型、双 Nav2 + 双 AMCL、桥接配置、RViz、一键 launch | 完成 | — |
-| `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗、失败冷却 + ROS 适配节点（订阅/服务/action/Marker） | 完成 | 54 gtest |
-| `fleet_perception` | 感知：HSV 颜色识别、单目测距、时序去抖、TF 转世界系 | 完成 | 31 gtest |
-| `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳 | 完成 | 17 gtest |
+| `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗、失败冷却 + ROS 适配节点（订阅/服务/action/Marker） | 完成 | 49 gtest |
+| `fleet_perception` | 感知：HSV 颜色识别、单目测距、时序去抖、TF 转世界系 | 完成 | 28 gtest |
+| `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳 | 完成 | 16 gtest |
+| `fleet_gui` | 监控台：任务/车辆/告警/日志、地图与相机、手动注入/取消、rosbag 时间轴回放 | 完成 | 13 gtest |
+| `fleet_integration` | 真调度中心 + 假执行代理的跨节点集成测试（launch_testing） | 完成 | 4 用例 |
+
+合计 **110 项测试，0 失败**（106 个 gtest + 4 个集成用例，`colcon test` 全绿）。
 
 分层原则：**能脱离 ROS 的数学与状态逻辑一律做成纯 C++ 库**，用注入时间驱动单测；ROS 节点只做接线与消息转换。
 
@@ -78,7 +93,7 @@
 - Gazebo Sim 10（`ros_gz_sim` 桥接）
 - Nav2 1.5.2（`nav2_controller/planner/behaviors/bt_navigator/map_server`）
 - OpenCV 4.10（`cv_bridge`）
-- Qt6（M8 监控端，已安装）
+- Qt6 Widgets + rosbag2（M8 监控端与时间轴回放）
 
 软件渲染环境下建议固定 `LIBGL_ALWAYS_SOFTWARE=1`（本项目已固化在 `~/.config/environment.d/`）。
 
@@ -95,11 +110,19 @@ source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 
-# 3. 一键启动：双机 + 地图 + 桥 + Nav2 + 感知 + 执行代理 + RViz
-ros2 launch fleet_bringup fleet_sim.launch.py gui:=false rviz:=true
+# 3. 一键启动：双机 + 地图 + 桥 + Nav2 + 感知 + 执行代理 + RViz + Qt 监控台
+ros2 launch fleet_bringup fleet_sim.launch.py gui:=false rviz:=true monitor:=true
+
+# 或单独开监控台（仿真已在跑时）
+ros2 run fleet_gui fleet_monitor
+
+# 4. 容器化运行（可选）
+docker compose build
+docker compose up -d sim       # 无界面仿真
+docker compose up monitor      # 需要图形会话
 ```
 
-常用开关：`gui:=false|true`、`rviz:=false|true`、`nav2:=false|true`、`perception:=false|true`、`agent:=false|true`、`manager:=false|true`。
+常用开关：`gui:=false|true`、`rviz:=false|true`、`nav2:=false|true`、`perception:=false|true`、`agent:=false|true`、`manager:=false|true`、`monitor:=false|true`。
 
 停仿真用 `./scripts/stop_sim.sh`：会 SIGTERM → 超时 SIGKILL，并清理 `/dev/shm/fastdds_*`。不要用 `pkill -f` 手工杀，卡在生命周期过渡的 Nav2 节点会忽略 SIGTERM 并残留成"同名僵尸节点"，下一次启动时生命周期管理器会卡住。
 
@@ -126,6 +149,22 @@ python3 scripts/fault_injector.py robot-offline --robot robot1 --hold 20
 python3 scripts/fault_injector.py nav-failure --robot robot1 --hold 25
 python3 scripts/fault_injector.py target-lost --block block_blue
 python3 scripts/fault_injector.py target-restore --block block_blue
+
+# 监控台：任务/车辆/相机；冻结 agent 后 2.5s 判离线
+ros2 run fleet_gui fleet_monitor
+python3 scripts/fault_injector.py robot-offline --robot robot1 --hold 20
+
+# 监控台回放：先录一段，再用时间轴回看
+./scripts/record_demo_bag.sh /tmp/demo_bag 90
+ros2 run fleet_gui fleet_monitor --replay /tmp/demo_bag
+
+# 集成测试：真调度中心 + 假执行代理（不需要 Gazebo）
+colcon test --packages-select fleet_integration --event-handlers console_direct+
+
+# CI 同款：全部单测 + 集成测试
+colcon test --packages-select fleet_manager fleet_perception fleet_agent fleet_gui fleet_integration \
+  --return-code-on-test-failure
+colcon test-result --all --verbose
 ```
 
 故障场景与预期（详细映射见 `scripts/fault_injector.py` 头部注释）：
@@ -196,9 +235,66 @@ python3 scripts/fault_injector.py target-restore --block block_blue
 | C 导航栈卡死 | 导航失败重排 / 原因 `NAV_ABORTED` / 改派 / 最终 `DONE` | 全通过 |
 | D 目标丢失 | 进入对位 / 最终 `FAILED` / 恰好重试 1 次 / 原因 `TARGET_LOST` | 全通过 |
 
+**监控端**（M8）
+
+| 项目 | 结果 |
+|---|---|
+| 双车在线状态 | 心跳 1 Hz，2.5 s 无心跳判离线；冻结 agent 后界面显示 `1/2 在线` 并给告警 |
+| 从未上线 | 只发现话题、没有心跳的车登记为"离线占位"，2 倍超时后告警一次 |
+| 相机流 | 320×240 @ 4~5 fps，与桥接帧率一致；切换车辆不重启节点 |
+| 任务表 | 12 个任务按 2 Hz 快照刷新，`revision` 去重、状态跳变去抖 |
+| 手动注入 | 颜色 + 坐标经 `/fleet/submit_task` 建单，成功/拒绝均有回显 |
+| rosbag 回放 | 88 s / 7 话题的 mcap：拖动时间轴、1/2/4/8 倍速播放正常 |
+| 单测 | `monitor_core` 11 gtest + `replay_core` 2 gtest（自写 bag 再读回） |
+
 ---
 
-## 6. 目录结构
+## 6. 监控端（M8）
+
+`fleet_gui` 是 Qt6 Widgets 桌面端：ROS 节点在独立线程跑单线程执行器，回调只做
+"消息 → 纯结构体 / QImage"的转换后发 Qt 信号，界面线程不加锁；任务合并、心跳判活、
+告警生成都在 `monitor_core` 里，用注入时间戳的单测覆盖。
+
+| 区域 | 内容 |
+|---|---|
+| 地图 | `/map` 栅格、机器人位姿与轨迹、任务目标；滚轮缩放、拖拽平移、双击复位 |
+| 任务表 | 任务号/颜色/状态/执行车/进度/重试/失败原因/首次发现时间；选中一行可取消 |
+| 车辆表 | 在线状态、位姿、当前任务、完成/失败数、心跳年龄与序号 |
+| 告警 / 日志 | 状态跳变、失败原因、重排、心跳中断；按严重度着色，告警单独一页 |
+| 相机 | `/robotN/camera/image` 实时流，可切换车辆，叠加分辨率与帧率 |
+| 操作 | 手动注入任务（颜色 + 坐标，支持地图点选）、取消选中任务 |
+| 回放 | 打开 rosbag2 目录，时间轴拖动 + 1/2/4/8 倍速；任务、心跳、状态事件可回放 |
+
+![监控台实时视图](docs/monitor_live.png)
+
+冻结 robot1 的 `robot_agent` 后：地图上该车变灰虚线、状态栏 `1/2 在线`、告警 +1。
+上方相机是 robot2 的画面（正在对位绿色物块）。
+
+![机器人离线](docs/monitor_offline.png)
+
+告警页把同一批事件按严重度单独列出（对应上图状态栏的 `告警 1`）：
+
+![告警页](docs/monitor_alarm.png)
+
+打开一段 rosbag：时间轴可拖动、可倍速；bag 里没有图像，相机页显示等待提示。
+
+![rosbag 回放](docs/monitor_replay.png)
+
+命令行参数：
+
+| 参数 | 用途 |
+|---|---|
+| `--camera <robot>` | 初始显示的相机（默认 robot1） |
+| `--tab <name>` | 初始页：任务 / 车辆 / 告警 / 日志（默认任务） |
+| `--replay <dir>` | 启动后直接载入 rosbag2 目录 |
+| `--screenshot <png> --quit-after <s>` | 渲染完成后截图并退出，用于验收/CI |
+
+回放数据用 `./scripts/record_demo_bag.sh [目录] [秒数]` 采集（任务快照、心跳、
+状态事件、检测结果，默认 90 s）；回放只读这三类话题，bag 里没有图像。
+
+---
+
+## 7. 目录结构
 
 ```
 fleet_ws/
@@ -210,20 +306,26 @@ fleet_ws/
 │   │   ├── models/robot1|2/ # 带相机与激光的 TurtleBot3
 │   │   ├── config/          # bridge.yaml / nav2_robot1.yaml / fleet.rviz
 │   │   └── launch/fleet_sim.launch.py
-│   ├── fleet_manager/       # 调度核心（纯逻辑，54 gtest）+ ROS 适配节点（fleet_manager_node）
+│   ├── fleet_manager/       # 调度核心（纯逻辑，49 gtest）+ ROS 适配节点（fleet_manager_node）
 │   │   └── scripts/verify_faults.py   # 四类故障注入验收（A/B/C/D）
-│   ├── fleet_perception/    # 颜色 + 测距 + 去抖（31 gtest，含验收脚本）
-│   └── fleet_agent/         # 执行代理（17 gtest，含验收脚本）
+│   ├── fleet_perception/    # 颜色 + 测距 + 去抖（28 gtest，含验收脚本）
+│   ├── fleet_agent/         # 执行代理（16 gtest，含验收脚本）
+│   ├── fleet_gui/           # 监控台（Qt6，monitor_core + replay_core 共 13 gtest）
+│   └── fleet_integration/   # 假 agent + launch_testing 集成测试（4 用例）
+├── docker/                  # Dockerfile + entrypoint
+├── .github/workflows/       # CI（构建/测试/镜像）
+├── docs/                    # 设计文档、交付文档、监控台截图
 └── scripts/
     ├── install_deps.sh      # 依赖安装（幂等、逐项累计失败）
     ├── fault_injector.py    # 故障注入器（SIGSTOP 进程 / 挪动物块）
+    ├── record_demo_bag.sh   # 录制标准回放包
     ├── stop_sim.sh          # SIGTERM→SIGKILL 停仿真并清 Fast DDS 共享内存
     └── commit.sh            # 固化提交身份、过滤协作标记
 ```
 
 ---
 
-## 7. 工程要点与踩坑记录
+## 8. 工程要点与踩坑记录
 
 这些问题都在仿真里实际踩过，修复方式已固化进代码：
 
@@ -248,6 +350,23 @@ fleet_ws/
 - 任务改派要校验归属：旧车恢复后补发的 `NAVIGATING/DONE` 和迟到的 action result 都可能落在已改派的任务上，必须比对 `assigned_robot` 与 `robot_task_`
 - 机器人从离线恢复时要撤销它残留的导航目标，否则它会去抢已经改派给别的车的物块
 
+**监控端（M8）**
+- 跨线程发自定义结构体信号必须注册元类型；`Q_DECLARE_METATYPE` 要放在一个被所有带 `Q_OBJECT` 的头文件共同包含的独立头里 —— 否则多个 moc 文件拼进 `mocs_compilation.cpp` 时会"先实例化、后特化"，编译直接报 `specialization after instantiation`
+- `QRectF::bottom()` 返回 `y + height`（不是最小 y），按直觉用它画地图会得到零高度矩形，表现为"地图收得到但画不出来"
+- 仿真里 `Task.detected_at` 是 sim time，与界面日志的墙钟不同源；任务表时间列改用"本端首次看到该任务"的时间，回放时改用 bag 录制时间
+- 只订阅 `/robotN/*` 时，agent 从未发过心跳的车在界面上根本不存在；发现话题后先登记成"离线占位"，2 倍心跳超时仍无心跳再告警一次
+- 回放只读 `/fleet/tasks`、`/robotN/robot_status`、`/robotN/task_status`：bag 里没有图像，相机页会显示等待提示
+- `QWidget::grab()` 在 offscreen 平台也能稳定出图，适合无人值守截图；不要指望窗口管理器按 `resize()` 给尺寸
+- 后台用 `ros2` 进程做故障注入时，若该进程依附于会被复用的终端，验证中途可能被连带杀掉，故障窗口就消失了；长时间保持的注入要 `setsid` 脱离终端
+
+**集成测试与交付（M9）**
+- `launch_testing` 的 `Node(executable=...)` 要求安装到 `lib/<pkg>/` 的名字不带 `.py`，用 `install(PROGRAMS ... RENAME fake_agent)`；否则报 `executable 'fake_agent' not found on the libexec directory`
+- 集成测试的 `wait_until` 持锁判断，若谓词内部再调 `snapshot()` 一类带锁的取值函数，普通 `Lock` 会自锁死（现象是 180 s 超时且没有任何断言输出）；改用 `RLock`
+- sqlite3 后端读出来 `send_timestamp` 恒为 0（只存一列 timestamp），时间轴要用 `recv_timestamp` 兜底；mcap 两者都有。回放实现已同时兼容
+- 本机访问不了 Docker Hub 时 `docker manifest inspect` / `docker pull` 都会失败，镜像是否可构建只能交给 CI 的 `docker` job；本地用 `docker compose config` 校验配置
+- CI 不跑 Gazebo：单测覆盖纯逻辑，跨节点链路用假 agent 覆盖；导航/对位/故障注入放在开发机按验收脚本执行
+- 回放自测需要真 bag，所以用 `rosbag2_cpp::SequentialWriter` 在临时目录造一个 sqlite3 包，再交给 `LoadBag` 读回
+
 **感知**
 - tf2 禁止在回调里带超时查 TF（数据靠本节点执行器喂入，带超时等于自己等自己）；图像戳常比最新 TF 早/晚几毫秒，失败时退化为"最新位姿"
 - 颜色阈值必须限制饱和度下限，否则灰白墙面与地面会被误判
@@ -260,31 +379,47 @@ fleet_ws/
 
 ---
 
-## 8. 已知限制
+## 9. 已知限制
 
 - 相机在软件渲染下实际约 4 Hz，视觉对位限速 0.15 m/s；激光约 2.3 Hz
 - 感知每色只上报一个目标（当前场景三色各一块足够），偏轴测距会系统性偏小
 - 两台车都接入 Nav2 + AMCL，`dispatch_robot_ids` 可控制派活范围
 - AMCL 依赖手写地图与仿真激光，真实场地需要重新建图并标定；粒子滤波在长走廊场景仍需调参
 - 调度中心的超时是"兜底"：正常失败由 agent 先报，看门狗只处理 agent 失联/卡死的情况
-- 监控端尚未开发（M8），当前只能通过话题与 RViz 观察
+- 监控端回放不含图像（bag 里没录相机），相机页在回放期间停更
+- 回放把整包读进内存，适合分钟级 bag；小时级数据需要改成按时间 seek
+- 任务表/车辆表每 500 ms 全量重建，任务数上千时需要换成增量模型
+- Qt 端在软件渲染下验证；高 DPI 与超宽屏未做专门适配
+- 集成测试覆盖的是 manager ↔ agent 契约，不覆盖 Nav2 / 感知链路，后者靠开发机仿真验收
+- Docker 镜像未在开发机实际构建（Docker Hub 不可达），仅在 CI 中构建验证
+- CI 不跑 Gazebo：3D 仿真慢且易受环境影响，仿真验收按交付文档手动执行
 
 ---
 
-## 9. 路线图
+## 10. 路线图
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | 环境骨架与接口层 | 完成 |
 | M1 | 仿真底座（世界/地图/模型/桥接/一键启动） | 完成 |
 | M2 | robot1 接入 Nav2 单机导航 | 完成 |
-| M3 | 调度核心逻辑与 54 个单测 | 完成 |
+| M3 | 调度核心逻辑与 49 个单测 | 完成 |
 | M4 | 感知层（颜色识别 + 单目测距 + 去抖） | 完成 |
 | M5 | 执行代理（Nav2 封装 + 视觉精对位 + 心跳） | 完成 |
 | M6 | `fleet_manager` ROS 适配：队列/分配/超时重试接 action，服务与 RViz Marker | 完成 |
 | M7 | 故障注入：目标丢失、导航失败、机器人离线、任务超时、重新分配 + AMCL 共享定位 | 完成 |
-| M8 | Qt6 监控端：任务列表、机器人在线状态、告警、日志、相机流、rosbag 时间轴检索 | 计划 |
-| M9 | 集成测试、rosbag 回放、Docker、CI、完整交付文档 | 计划 |
+| M8 | Qt6 监控端：任务列表、机器人在线状态、告警、日志、相机流、rosbag 时间轴检索 | 完成 |
+| M9 | 集成测试、rosbag 回放固化、Docker、CI、交付文档 | 完成 |
+
+后续可选方向：真机适配（重新建图与相机标定）、多楼层/多区域地图切换、
+Fast DDS Discovery Server 跨主机部署、任务数上千时的增量式监控模型。
+
+---
+
+## 11. 相关文档
+
+- [交付文档](docs/交付文档.md)：部署（本地/Docker/CI）、运行手册、故障处理、验收矩阵
+- [项目设计文档](docs/项目设计文档_v2.md)：架构与模块设计
 
 ---
 

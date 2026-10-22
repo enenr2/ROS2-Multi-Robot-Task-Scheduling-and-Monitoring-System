@@ -11,7 +11,7 @@
 # 用法：./scripts/stop_sim.sh
 set -uo pipefail
 
-PATTERN='ros2 launch fleet_bringup|gz-sim-main|ros_gz_bridge|parameter_bridge|robot_state_publisher|static_transform_publisher|nav2_|robot_agent|perception_node|fleet_manager_node|rviz2'
+PATTERN='ros2 launch fleet_bringup|gz-sim-main|ros_gz_bridge|parameter_bridge|robot_state_publisher|static_transform_publisher|nav2_|robot_agent|perception_node|fleet_manager_node|rviz2|fleet_monitor'
 
 collect_pids() {
   ps -eo pid,args | grep -E "$PATTERN" | grep -v grep | awk '{print $1}'

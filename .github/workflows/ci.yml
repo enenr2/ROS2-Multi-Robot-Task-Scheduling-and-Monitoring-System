@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 单测 + 集成测试。不跑 Gazebo：3D 仿真在 CI 里又慢又不稳，
+  # 调度/感知/代理的核心逻辑都用纯逻辑库覆盖，跨节点链路用假 agent 覆盖。
+  build-and-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    container:
+      image: ros:lyrical-ros-base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ros-${ROS_DISTRO}-navigation2 \
+            ros-${ROS_DISTRO}-nav2-msgs \
+            ros-${ROS_DISTRO}-cv-bridge \
+            ros-${ROS_DISTRO}-vision-opencv \
+            ros-${ROS_DISTRO}-rosbag2 \
+            ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+            ros-${ROS_DISTRO}-launch-testing \
+            ros-${ROS_DISTRO}-launch-testing-ament-cmake \
+            ros-${ROS_DISTRO}-launch-testing-ros \
+            qt6-base-dev \
+            python3-colcon-common-extensions
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          colcon build --packages-skip fleet_bringup \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          source install/setup.bash
+          colcon test \
+            --packages-select fleet_manager fleet_perception fleet_agent fleet_gui fleet_integration \
+            --event-handlers console_direct+ \
+            --return-code-on-test-failure
+
+      - name: Test report
+        if: always()
+        shell: bash
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          source install/setup.bash
+          colcon test-result --all --verbose
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/*/test_results/**
+          if-no-files-found: ignore
+
+  # 镜像构建只验证 Dockerfile 可用，不推仓库
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          tags: fleet-sim:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
