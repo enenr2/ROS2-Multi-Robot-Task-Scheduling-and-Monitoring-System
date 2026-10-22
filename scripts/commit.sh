@@ -83,4 +83,12 @@ if [[ $FAILED -ne 0 ]]; then
   exit 1
 fi
 
+# 漏文件自检：-a 只暂存"已跟踪"文件的改动，新建文件会被漏掉。
+# 此前因此推过一个"CMake 引用了不存在的源码"的提交，这里必须提醒。
+UNTRACKED="$(git status --porcelain | grep '^??' || true)"
+if [[ -n "$UNTRACKED" ]]; then
+  echo "[WW] 仍有未跟踪文件未提交，确认是否属于本次改动：" >&2
+  printf '%s\n' "$UNTRACKED" >&2
+fi
+
 echo "[OK] 已提交: $(git log -1 --format='%h %an <%ae> | %s')"
