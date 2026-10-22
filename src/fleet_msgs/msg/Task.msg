@@ -18,3 +18,4 @@ builtin_interfaces/Time detected_at    # 目标首次被检测到的时间
 builtin_interfaces/Time assigned_at    # 最近一次分配时间，未分配时为 0
 uint8 retry_count
 uint8 max_retries
+string failure_reason        # 最近一次失败原因，成功/进行中为 "NONE"

@@ -5,13 +5,54 @@
 #      才会被匹配到；实测顶层直接写 plain 节点名在命名空间下匹配不上
 #   2. 帧名必须带机器人前缀（robot1_xxx），因为两台车共用一棵 TF 树
 #
-# 不使用 AMCL：仿真里程计无噪声，map -> robot1_odom 由静态 TF 直接给出，
-# 定位是精确的，把精力留给调度与故障恢复。
+# 使用 AMCL：tb3 的 /robotN/odom 是轮速积分（实测跑十几米能偏 1~3 m），
+# 单机闭环靠同一份漂移还能自洽，但任务改派后新车要按旧车报的世界坐标去
+# 同一个物块，两边坐标系不一致就会停偏一两米。用 /scan + /map 做 AMCL，
+# map -> robotN_odom 由 AMCL 动态给出，两台车统一到同一张地图上。
 #
 # 控制器选 RPP 而非 MPPI：本机是软件渲染 VM，MPPI 默认 2000 条采样
 # 在这个环境下过重；RPP 更轻，且低速下轨迹质量足够。
 
 robot1:
+  amcl:
+    ros__parameters:
+      use_sim_time: true
+      base_frame_id: robot1_base_footprint
+      odom_frame_id: robot1_odom
+      global_frame_id: map
+      scan_topic: scan
+      map_topic: map
+      # 仿真激光无噪声，粒子数不用给太多
+      min_particles: 500
+      max_particles: 2000
+      pf_err: 0.05
+      pf_z: 0.99
+      resample_interval: 1
+      update_min_d: 0.15
+      update_min_a: 0.15
+      transform_tolerance: 1.0
+      robot_model_type: nav2_amcl::DifferentialMotionModel
+      alpha1: 0.2
+      alpha2: 0.2
+      alpha3: 0.2
+      alpha4: 0.2
+      alpha5: 0.2
+      laser_model_type: likelihood_field
+      laser_min_range: 0.12
+      laser_max_range: 3.5
+      max_beams: 60
+      sigma_hit: 0.2
+      lambda_short: 0.1
+      z_hit: 0.5
+      z_short: 0.05
+      z_max: 0.05
+      z_rand: 0.5
+      do_beamskip: false
+      # 初始位姿在 launch 里按每台车的出生点覆盖
+      set_initial_pose: true
+      always_reset_initial_pose: false
+      tf_broadcast: true
+
   controller_server:
     ros__parameters:
       use_sim_time: true
@@ -228,6 +269,7 @@ robot1:
       use_sim_time: true
       autostart: true
       node_names:
+        - amcl              # 先起定位，后面的代价地图才有 map -> odom
         - controller_server
         - planner_server
         - behavior_server

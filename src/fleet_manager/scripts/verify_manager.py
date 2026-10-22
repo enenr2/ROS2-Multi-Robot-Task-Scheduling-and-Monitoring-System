@@ -58,10 +58,15 @@ def check(label, ok, detail=''):
         FAILURES.append(label)
 
 
-def point_in_wall(x, y):
-    """世界里的三段内隔断（与 worlds/fleet_tasks.sdf 一致）"""
+def point_in_wall(x, y, margin=0.0):
+    """世界里的三段内隔断（与 worlds/fleet_tasks.sdf 一致）。
+
+    margin 用来把"贴着墙但没进墙"的位置也排除掉：物块放在隔断端头 0.1 m
+    时，另一台车绕到对面常常看不到它（相机 FOV 被墙切掉一半），对位阶段
+    会误报 TARGET_LOST。
+    """
     for x0, y0, x1, y1 in WALLS:
-        if x0 <= x <= x1 and y0 <= y <= y1:
+        if x0 - margin <= x <= x1 + margin and y0 - margin <= y <= y1 + margin:
             return True
     return False
 
@@ -88,7 +93,7 @@ def choose_spot(rx, ry, yaw):
             by = ry + distance * math.sin(th)
             if abs(bx) > 9.3 or abs(by) > 9.3:
                 continue
-            if point_in_wall(bx, by) or path_blocked(rx, ry, bx, by):
+            if point_in_wall(bx, by, 0.6) or path_blocked(rx, ry, bx, by):
                 continue
             return bx, by
     return None
@@ -123,12 +128,18 @@ def clear_active_tasks(probe, timeout=30.0):
 def set_pose(name, x, y, z=BLOCK_Z, yaw=0.0):
     req = (f'name: "{name}", position: {{x: {x}, y: {y}, z: {z}}}, '
            f'orientation: {{z: {math.sin(yaw / 2)}, w: {math.cos(yaw / 2)}}}')
-    out = subprocess.run(['gz', 'service', '-s', f'/world/{WORLD}/set_pose',
-                          '--reqtype', 'gz.msgs.Pose', '--reptype', 'gz.msgs.Boolean',
-                          '--timeout', '2000', '--req', req],
-                         capture_output=True, text=True, timeout=15)
-    if 'data: true' not in out.stdout:
-        raise RuntimeError(f'set_pose({name}) 失败: {out.stdout}{out.stderr}')
+    # 仿真满载时 gz 服务的响应会迟到，2s 超时偶发失败；重试一次比让整个
+    # 验收脚本崩在摆位上更划算
+    for attempt in range(2):
+        out = subprocess.run(['gz', 'service', '-s', f'/world/{WORLD}/set_pose',
+                              '--reqtype', 'gz.msgs.Pose', '--reptype', 'gz.msgs.Boolean',
+                              '--timeout', '5000', '--req', req],
+                             capture_output=True, text=True, timeout=20)
+        if 'data: true' in out.stdout:
+            return
+        if attempt == 0:
+            time.sleep(0.5)
+    raise RuntimeError(f'set_pose({name}) 失败: {out.stdout}{out.stderr}')
 
 
 class ManagerProbe(Node):

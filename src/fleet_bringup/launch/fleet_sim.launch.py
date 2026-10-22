@@ -1,5 +1,6 @@
 """多机器人仿真启动：一个 gz 世界 + 两台 namespace 隔离的 TurtleBot3。"""
 import os
+import tempfile
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_share_directory
@@ -22,7 +23,7 @@ def generate_launch_description():
     urdf_file = os.path.join(bringup, 'urdf', 'turtlebot3_burger_fleet.urdf')
     rviz_config = os.path.join(bringup, 'config', 'fleet.rviz')
     map_yaml = os.path.join(bringup, 'maps', 'fleet_map.yaml')
-    nav2_params = os.path.join(bringup, 'config', 'nav2_robot1.yaml')
+    nav2_template = os.path.join(bringup, 'config', 'nav2_robot1.yaml')
 
     with open(urdf_file, 'r') as f:
         urdf_text = f.read()
@@ -111,17 +112,9 @@ def generate_launch_description():
                         ('robot_description', name + '/robot_description')],
             output='screen'))
 
-        # map → 各车 odom 系的静态变换：
-        # gz 的里程计以出生点为原点，所以用出生位姿当静态变换，
-        # 两台车才能同时显示在同一个地图坐标系下（帧名遵循 Nav2 惯例）
-        actions.append(Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name=name + '_map_tf',
-            arguments=['--x', x, '--y', y, '--z', '0',
-                       '--frame-id', 'map',
-                       '--child-frame-id', name + '_odom'],
-            output='screen'))
+        # map → robotN_odom 不再用静态 TF：改由每台车的 AMCL 动态发布。
+        # gz 的 odom 是轮速积分，跑十几米就会漂 1~3 m；静态 TF 等于把这个
+        # 漂移固化进地图坐标系，两台车各漂各的，任务改派时目标点就对不上。
 
         # ⑤ 生成实体
         actions.append(Node(
@@ -133,47 +126,67 @@ def generate_launch_description():
                        '-x', x, '-y', y, '-z', '0.05'],
             output='screen'))
 
-    # ⑥ Nav2 导航栈：只给 robot1 起（M2 阶段先跑通单机）
+    # ⑥ Nav2 导航栈：每台车一套（各自命名空间 + 各自帧名）
     #
     # 三处必须显式处理，否则多机 TF 场景下必挂：
     #   1. tf / tf_static 强制指向全局话题。Nav2 官方 launch 把 '/tf' 重映射成
     #      相对名 'tf'，在命名空间下会变成 /robot1/tf —— 但我们两台车共用
     #      一棵 TF 树（帧名已带前缀），必须都读全局 /tf
     #   2. map 指向全局地图。全局代价地图的静态层默认订阅相对 'map'，
-    #      在命名空间下会解析成 /robot1/map，而地图是全局共享的 /map
-    #   3. 帧名在 nav2_robot1.yaml 里已写成 robot1_xxx，与 TF 树一致
-    NAV2_NS = 'robot1'
+    #      在命名空间下会解析成 /robotN/map，而地图是全局共享的 /map
+    #   3. 帧名、odom 话题都带机器人前缀：两份参数文件由同一份模板生成
+    def nav2_params_for(name):
+        text = open(nav2_template, encoding='utf-8').read()
+        if name != 'robot1':
+            # 模板以 robot1 为基准，其余车只改前缀，避免维护两份几乎相同的 yaml
+            text = text.replace('robot1', name)
+        path = os.path.join(tempfile.gettempdir(), f'nav2_{name}_{os.getpid()}.yaml')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return path
 
-    def nav2_node(pkg, exe, node_name, extra_remaps=(), extra_params=None):
+    def nav2_node(name, pkg, exe, node_name, extra_remaps=(), extra_params=None):
         return Node(
             package=pkg, executable=exe, name=node_name,
-            namespace=NAV2_NS,
-            parameters=[nav2_params] + ([extra_params] if extra_params else []),
-            remappings=[('/tf', '/tf'), ('/tf_static', '/tf_static')] + list(extra_remaps),
+            namespace=name,
+            parameters=[nav2_params_for(name)] + ([extra_params] if extra_params else []),
+            remappings=[('/tf', '/tf'), ('/tf_static', '/tf_static')] +
+                       [(f'/{name}/map', '/map')] + list(extra_remaps),
             condition=IfCondition(LaunchConfiguration('nav2')),
             output='screen')
 
-    nav2_nodes = [
-        # 代价地图是 controller_server / planner_server 的子节点，
-        # 所以 map 的重映射挂在父节点上，子节点同进程生效。
-        # 注意必须写全限定名 '/robot1/map'：Nav2 把 map 解析成父命名空间下的
-        # /robot1/map，用相对名 'map' 作重映射源匹配不上（实测无效）
-        nav2_node('nav2_controller', 'controller_server', 'controller_server'),
-        nav2_node('nav2_planner', 'planner_server', 'planner_server',
-                  [('/robot1/map', '/map')]),
-        nav2_node('nav2_behaviors', 'behavior_server', 'behavior_server'),
-        nav2_node('nav2_bt_navigator', 'bt_navigator', 'bt_navigator'),
-        # service_timeout 默认 5s：本机在 RViz + 双相机同时渲染时会超时，
-        # 表现为 get_state 请求发不出去、bringup 直接中止（实测遇到过两次）。
-        # 放宽到 20s 换启动成功率，代价是真挂时多等一会儿
-        nav2_node('nav2_lifecycle_manager', 'lifecycle_manager',
-                  'lifecycle_manager_navigation', (),
-                  {'service_timeout': 20.0}),
-    ]
+    for idx, (name, x0, y0) in enumerate(robots):
+        nav2_nodes = [
+            # AMCL：订阅本车 scan + 全局地图，动态发布 map -> robotN_odom。
+            # 初始位姿用出生点，省掉"在 RViz 里点 2D Pose Estimate"这一步
+            nav2_node(name, 'nav2_amcl', 'amcl', 'amcl', (),
+                      {'set_initial_pose': True,
+                       'initial_pose.x': float(x0),
+                       'initial_pose.y': float(y0),
+                       'initial_pose.z': 0.0,
+                       'initial_pose.yaw': 0.0}),
+            # 代价地图是 controller_server / planner_server 的子节点，
+            # 所以 map 的重映射挂在父节点上，子节点同进程生效。
+            # 注意必须写全限定名 '/robotN/map'：Nav2 把 map 解析成父命名空间下的
+            # /robotN/map，用相对名 'map' 作重映射源匹配不上（实测无效）
+            nav2_node(name, 'nav2_controller', 'controller_server', 'controller_server'),
+            nav2_node(name, 'nav2_planner', 'planner_server', 'planner_server'),
+            nav2_node(name, 'nav2_behaviors', 'behavior_server', 'behavior_server'),
+            nav2_node(name, 'nav2_bt_navigator', 'bt_navigator', 'bt_navigator'),
+            # service_timeout 默认 5s：本机在 RViz + 双相机同时渲染时会超时，
+            # 表现为 get_state 请求发不出去、bringup 直接中止（实测遇到过两次）。
+            # 放宽到 20s 换启动成功率，代价是真挂时多等一会儿
+            nav2_node(name, 'nav2_lifecycle_manager', 'lifecycle_manager',
+                      'lifecycle_manager_navigation', (),
+                      {'service_timeout': 20.0}),
+        ]
 
-    # 延迟启动 Nav2：等 gz 出 clock、桥出 odom/scan、TF 树建起来之后再拉，
-    # 否则生命周期节点会因拿不到初始位姿而卡在 inactive
-    actions.append(TimerAction(period=10.0, actions=nav2_nodes))
+        # 延迟启动 Nav2：等 gz 出 clock、桥出 odom/scan、TF 树建起来之后再拉，
+        # 否则生命周期节点会因拿不到初始位姿而卡在 inactive。
+        # 两套栈错开 10s 起：10 个 Nav2 进程同时上线时，DDS 发现阶段会把
+        # lifecycle 的 change_state 响应挤掉（现象是 "failed to send response
+        # to .../change_state (timeout)"，bringup 永久卡在 Configuring xxx）
+        actions.append(TimerAction(period=10.0 + 10.0 * idx, actions=nav2_nodes))
 
     # ⑥' 视觉感知：每台车一个节点，订阅各自命名空间下的相机，输出 detections
     # 感知节点不依赖 Nav2，但依赖 TF 树（map <- robotN_camera_link），
@@ -215,20 +228,21 @@ def generate_launch_description():
             }],
             condition=IfCondition(LaunchConfiguration('agent')),
             output='screen'))
-    actions.append(TimerAction(period=14.0, actions=agent_nodes))
+    # 等第二套 Nav2（20s 起）也激活完再拉代理
+    actions.append(TimerAction(period=26.0, actions=agent_nodes))
 
     # ⑥''' 调度中心：订阅各车感知与状态，按任务表分配并直调 execute_task。
     # 放在代理之后起，保证第一拍分配时 action 服务端已就绪
     actions.append(TimerAction(
-        period=18.0,
+        period=30.0,
         actions=[Node(
             package='fleet_manager',
             executable='fleet_manager_node',
             name='fleet_manager',
             parameters=[{
                 'robot_ids': [name for name, _x, _y in robots],
-                # 目前只有 robot1 接了 Nav2，robot2 只监控不派活
-                'dispatch_robot_ids': ['robot1'],
+                # 两台车都接 Nav2 后可同时派活（M7 的重分配演示依赖这一条）
+                'dispatch_robot_ids': [name for name, _x, _y in robots],
                 'standoff': 0.6,
                 'publish_markers': True,
             }],

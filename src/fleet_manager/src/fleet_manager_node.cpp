@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <vector>
 
 namespace fleet {
 namespace {
@@ -10,7 +11,6 @@ namespace {
 constexpr const char* kReasonAssignTimeout = "ASSIGN_TIMEOUT";
 constexpr const char* kReasonAgentFailed = "AGENT_FAILED";
 constexpr const char* kReasonGoalRejected = "GOAL_REJECTED";
-constexpr const char* kReasonRobotOffline = "ROBOT_OFFLINE";
 constexpr const char* kReasonUnknownTask = "UNKNOWN_TASK";
 
 bool IsActiveState(TaskState s)
@@ -92,9 +92,12 @@ FleetManagerNode::FleetManagerNode()
   }()),
   watchdog_([] {
     WatchdogConfig cfg;
-    // 都略大于 agent 自身的超时，作为"最后一道兜底"，避免和 agent 抢着判失败
+    // 默认值都略大于 agent 自身的超时，作为"最后一道兜底"，
+    // 避免和 agent 抢着判失败；运行时可用参数调小，供故障注入使用
+    // dock_timeout 是"从派单到对位结束"的总预算（fleet_core 的实现口径），
+    // 必须大于 nav_timeout，否则导航稍慢一点就永远没机会进入对位
     cfg.nav_timeout = 100 * kSecond;
-    cfg.dock_timeout = 25 * kSecond;
+    cfg.dock_timeout = 150 * kSecond;
     cfg.assign_timeout = 30 * kSecond;
     cfg.heartbeat_timeout = 3 * kSecond;
     return cfg;
@@ -106,6 +109,45 @@ FleetManagerNode::FleetManagerNode()
     "dispatch_robot_ids", std::vector<std::string>{"robot1"});
   standoff_ = declare_parameter<double>("standoff", 0.6);
   publish_markers_ = declare_parameter<bool>("publish_markers", true);
+
+  // 看门狗时限做成参数：正常运行时是兜底，故障注入/调参时可以在线缩短
+  WatchdogConfig wd;
+  wd.nav_timeout = static_cast<TimeNs>(declare_parameter<double>("nav_timeout", 100.0) * kSecond);
+  wd.dock_timeout = static_cast<TimeNs>(declare_parameter<double>("dock_timeout", 150.0) * kSecond);
+  wd.assign_timeout =
+    static_cast<TimeNs>(declare_parameter<double>("assign_timeout", 30.0) * kSecond);
+  wd.heartbeat_timeout =
+    static_cast<TimeNs>(declare_parameter<double>("heartbeat_timeout", 3.0) * kSecond);
+  watchdog_cfg_ = wd;
+  watchdog_ = Watchdog(wd);
+  cooldown_ns_ = static_cast<TimeNs>(
+    declare_parameter<double>("retry_cooldown", 10.0) * kSecond);
+
+  // 允许在线调整超时：故障注入要能把"导航卡死多久算超时"缩短到十几秒，
+  // 否则一次注入得等 100 s 才看得到看门狗动作
+  param_cb_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter>& params) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      WatchdogConfig cfg = watchdog_cfg_;
+      for (const auto& p : params) {
+        const auto name = p.get_name();
+        if (name == "nav_timeout") {
+          cfg.nav_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
+        } else if (name == "dock_timeout") {
+          cfg.dock_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
+        } else if (name == "assign_timeout") {
+          cfg.assign_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
+        } else if (name == "heartbeat_timeout") {
+          cfg.heartbeat_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
+        } else if (name == "retry_cooldown") {
+          cooldown_ns_ = static_cast<TimeNs>(p.as_double() * kSecond);
+        }
+      }
+      watchdog_cfg_ = cfg;
+      watchdog_ = Watchdog(cfg);
+      return result;
+    });
 
   client_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
@@ -187,6 +229,14 @@ void FleetManagerNode::OnTaskStatus(const fleet_msgs::msg::TaskStatus& msg)
   if (t == nullptr) {
     return;
   }
+  // 只接受"当前归属车"的状态上报。故障恢复后，被冻结又恢复的旧车会把
+  // 迟到的 NAVIGATING/DONE 发上来，若不校验归属就会把已改派的任务改乱
+  if (t->assigned_robot.empty() || t->assigned_robot != msg.robot_id) {
+    RCLCPP_DEBUG(get_logger(), "忽略 %s 对任务 %s 的迟到状态 %u（归属 %s）",
+                 msg.robot_id.c_str(), msg.task_id.c_str(), msg.state,
+                 t->assigned_robot.c_str());
+    return;
+  }
   const TimeNs now = NowNs();
 
   switch (msg.state) {
@@ -213,6 +263,7 @@ void FleetManagerNode::OnTaskStatus(const fleet_msgs::msg::TaskStatus& msg)
       const std::string reason = msg.failure_reason.empty() ? kReasonAgentFailed
                                                             : msg.failure_reason;
       const bool retried = queue_.RetryOrFail(msg.task_id, now, reason);
+      MarkCooldown(msg.robot_id);
       RCLCPP_WARN(get_logger(), "任务 %s 失败(%s)，%s", msg.task_id.c_str(), reason.c_str(),
                   retried ? "已重排等待改派" : "重试配额用尽，置为 FAILED");
       ReleaseRobot(msg.robot_id);
@@ -238,6 +289,8 @@ void FleetManagerNode::OnRobotStatus(const fleet_msgs::msg::RobotStatus& msg)
     return;
   }
   Robot& r = it->second;
+  const bool was_offline = r.state == RobotState::kOffline;
+  const bool had_heartbeat = r.last_heartbeat != 0;
   r.pose = Pose2D{msg.pose.position.x, msg.pose.position.y,
                   YawFromQuaternion(msg.pose.orientation)};
   r.last_heartbeat = NowNs();
@@ -255,6 +308,17 @@ void FleetManagerNode::OnRobotStatus(const fleet_msgs::msg::RobotStatus& msg)
     r.state = RobotState::kBusy;
   } else {
     r.state = RobotState::kIdle;
+  }
+
+  // 从离线恢复：撤销该车上可能残留的旧目标。
+  // 进程被冻住期间收到的 action 目标，恢复后仍会继续执行 —— 如果那个任务
+  // 已经改派给别的车，这辆车就会去抢同一个物块（实测发生过）。
+  if (was_offline && had_heartbeat) {
+    auto client_it = clients_.find(r.id);
+    if (client_it != clients_.end()) {
+      client_it->second->async_cancel_all_goals();
+      RCLCPP_INFO(get_logger(), "机器人 %s 恢复上线，已撤销其残留的旧目标", r.id.c_str());
+    }
   }
 }
 
@@ -326,7 +390,8 @@ void FleetManagerNode::HandleWatchdog(TimeNs now)
         RCLCPP_WARN(get_logger(), "机器人 %s 心跳超时，标记离线", ev.robot_id.c_str());
         robot.state = RobotState::kOffline;
       }
-      FailActiveTask(ev.robot_id, kReasonRobotOffline);
+      // 用看门狗给的 reason（ROBOT_UNREACHABLE），与 TaskStatus 的失败原因枚举保持一致
+      FailActiveTask(ev.robot_id, ev.reason);
       continue;
     }
 
@@ -352,6 +417,7 @@ void FleetManagerNode::HandleWatchdog(TimeNs now)
                 ev.reason.c_str(), static_cast<double>(ev.overdue) / kSecond,
                 retried ? "已重排" : "重试配额用尽");
     if (!robot.empty()) {
+      MarkCooldown(robot);
       ReleaseRobot(robot, robots_[robot].state == RobotState::kOffline);
     }
   }
@@ -428,6 +494,14 @@ bool FleetManagerNode::SendGoal(const RobotId& robot, const Task& task)
 void FleetManagerNode::OnGoalResponse(const RobotId& robot, const TaskId& task_id,
                                       const GoalHandle::SharedPtr& handle)
 {
+  // 归属校验：故障恢复后旧车可能补发 goal 响应，此时任务早已改派
+  const auto owned = robot_task_.find(robot);
+  if (owned == robot_task_.end() || owned->second != task_id) {
+    RCLCPP_DEBUG(get_logger(), "忽略 %s 对任务 %s 的迟到 goal 响应", robot.c_str(),
+                 task_id.c_str());
+    return;
+  }
+
   if (handle != nullptr) {
     active_goals_[robot] = handle;
     return;
@@ -445,6 +519,14 @@ void FleetManagerNode::OnGoalResponse(const RobotId& robot, const TaskId& task_i
 void FleetManagerNode::OnActionResult(const RobotId& robot, const TaskId& task_id,
                                       const GoalHandle::WrappedResult& wrapped)
 {
+  // 只有"当前归属车"的结果才算数：被冻结后恢复的旧车会补发旧任务的失败结果，
+  // 若不校验就会把已改派、正在别的车上执行的任务误判为失败（实测踩过）
+  const auto owned = robot_task_.find(robot);
+  if (owned == robot_task_.end() || owned->second != task_id) {
+    RCLCPP_DEBUG(get_logger(), "忽略 %s 对任务 %s 的迟到结果", robot.c_str(),
+                 task_id.c_str());
+    return;
+  }
   active_goals_.erase(robot);
 
   const Task* t = queue_.Find(task_id);
@@ -469,10 +551,12 @@ void FleetManagerNode::OnActionResult(const RobotId& robot, const TaskId& task_i
                                                    : kReasonAgentFailed;
     if (reason.empty() || reason == "NONE") {
       reason = kReasonAgentFailed;
+    MarkCooldown(robot);
     }
     const bool retried = queue_.RetryOrFail(task_id, now, reason);
     RCLCPP_WARN(get_logger(), "任务 %s 由 %s 执行失败(%s)，%s", task_id.c_str(),
                 robot.c_str(), reason.c_str(), retried ? "已重排" : "置为 FAILED");
+    MarkCooldown(robot);
   }
   ReleaseRobot(robot);
 }
@@ -544,6 +628,7 @@ void FleetManagerNode::PublishTaskSnapshot()
     msg.assigned_at = ToMsgTime(task.assigned_at);
     msg.retry_count = task.retry_count;
     msg.max_retries = task.max_retries;
+    msg.failure_reason = task.failure_reason.empty() ? "NONE" : task.failure_reason;
     task_pub_->publish(msg);
   }
 }
@@ -622,11 +707,23 @@ std::vector<Robot> FleetManagerNode::IdleRobots() const
     }
     const bool dispatchable =
       std::find(dispatch_ids_.begin(), dispatch_ids_.end(), kv.first) != dispatch_ids_.end();
-    if (dispatchable) {
+    const auto cool = cooldown_until_.find(kv.first);
+    const bool cooling = cool != cooldown_until_.end() && cool->second > NowNs();
+    if (dispatchable && !cooling) {
       out.push_back(kv.second);
     }
   }
   return out;
+}
+
+void FleetManagerNode::MarkCooldown(const RobotId& robot)
+{
+  if (cooldown_ns_ <= 0) {
+    return;
+  }
+  cooldown_until_[robot] = NowNs() + cooldown_ns_;
+  RCLCPP_INFO(get_logger(), "机器人 %s 进入 %.0fs 冷却，期间不接新任务",
+              robot.c_str(), static_cast<double>(cooldown_ns_) / kSecond);
 }
 
 const RobotId* FleetManagerNode::RobotOfTask(const TaskId& id) const
@@ -639,9 +736,9 @@ const RobotId* FleetManagerNode::RobotOfTask(const TaskId& id) const
   return nullptr;
 }
 
-TimeNs FleetManagerNode::NowNs()
+TimeNs FleetManagerNode::NowNs() const
 {
-  return now().nanoseconds();
+  return get_clock()->now().nanoseconds();
 }
 
 }  // namespace fleet

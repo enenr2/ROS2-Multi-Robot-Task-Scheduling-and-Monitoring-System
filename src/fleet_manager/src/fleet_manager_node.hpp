@@ -68,19 +68,23 @@ private:
   // ---- 状态工具 ----
   void ReleaseRobot(const RobotId& robot, bool offline = false);
   void FailActiveTask(const RobotId& robot, const std::string& reason);
+  void MarkCooldown(const RobotId& robot);
   void PublishTaskSnapshot();
   void PublishMarkers();
   std::vector<Robot> RobotList() const;
   std::vector<Robot> IdleRobots() const;
   const RobotId* RobotOfTask(const TaskId& id) const;
 
-  TimeNs NowNs();
+  TimeNs NowNs() const;
 
   // ---- 配置 ----
   double standoff_{0.6};
   bool publish_markers_{true};
   // 只有这些车会接任务：robot2 目前没有 Nav2，只作为可观测实例
   std::vector<std::string> dispatch_ids_;
+  // 失败冷却：刚失败的车短时间内不再接单，否则重试会被"最近优先"又派回同一台
+  TimeNs cooldown_ns_{10 * kSecond};
+  WatchdogConfig watchdog_cfg_;
 
   // ---- 内核 ----
   TaskQueue queue_;
@@ -92,6 +96,7 @@ private:
   std::map<RobotId, std::shared_ptr<rclcpp_action::Client<ExecuteTask>>> clients_;
   std::map<RobotId, GoalHandle::SharedPtr> active_goals_;
   std::map<RobotId, TaskId> robot_task_;
+  std::map<RobotId, TimeNs> cooldown_until_;
   uint64_t task_seq_{0};
 
   // ---- ROS 实体 ----
@@ -104,6 +109,7 @@ private:
   rclcpp::Service<fleet_msgs::srv::SubmitTask>::SharedPtr submit_srv_;
   rclcpp::Service<fleet_msgs::srv::CancelTask>::SharedPtr cancel_srv_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 };
 
 }  // namespace fleet

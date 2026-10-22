@@ -56,6 +56,13 @@ constexpr const char* kReasonDockTimeout = "DOCK_TIMEOUT";
 constexpr const char* kReasonUnreachable = "ROBOT_UNREACHABLE";
 constexpr const char* kReasonCanceled = "CANCELED_BY_OPERATOR";
 
+// 到达对位点后没看到目标时的搜索参数：
+// 先 0.12 m/s 倒车 4 s（退出"贴脸"盲区），再 0.45 rad/s 转一圈（约 14 s）
+constexpr double kSearchYawRate = 0.45;
+constexpr double kSearchBudgetSec = 18.0;
+constexpr double kSearchBackoffVel = 0.12;
+constexpr double kSearchBackoffSec = 4.0;
+
 double Clamp01(double v)
 {
   return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
@@ -352,8 +359,11 @@ private:
     PublishTaskStatus(TaskState::kDocking, 0.6, "视觉对位中");
 
     double start_range = -1.0;
+    bool ever_seen = false;
     const auto period = std::chrono::milliseconds(100);
     const rclcpp::Time dock_start = now();
+    // 进入对位前的检测不算数：导航途中看到过目标，不代表到了对位点还能看到
+    const TimeNs dock_start_ns = NowNs();
 
     while (rclcpp::ok()) {
       if (handle->is_canceling()) {
@@ -364,6 +374,7 @@ private:
       }
 
       DockingInput in;
+      bool fresh_since_dock = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto& slot = detections_[color];
@@ -371,6 +382,64 @@ private:
         in.target_visible = slot.has && slot.stamp_ns > 0 && age <= detection_stale_s_;
         in.bearing = slot.bearing;
         in.range = slot.range;
+        fresh_since_dock = in.target_visible && slot.stamp_ns > dock_start_ns;
+      }
+      ever_seen = ever_seen || fresh_since_dock;
+
+      // 到了预定位置却始终没看到目标：多半是任务改派时沿用了上一台车报的
+      // 世界坐标，两台车的里程计漂移不同，落点会差出半米到一米。原地转一圈
+      // 把目标找回来再对位，比直接判 TARGET_LOST 更符合实际系统
+      if (!in.target_visible && !ever_seen && (now() - dock_start).seconds() > 1.5) {
+        RCLCPP_INFO(get_logger(), "到达对位位置后未见目标，先倒车再原地搜索");
+        PublishTaskStatus(TaskState::kDocking, 0.6, "目标不在视野，倒车搜索");
+        auto visible = [this, color]() {
+          std::lock_guard<std::mutex> lock(mutex_);
+          const auto& slot = detections_[color];
+          const double age =
+            static_cast<double>(NowNs() - slot.stamp_ns) / static_cast<double>(kSec);
+          return slot.has && slot.stamp_ns > 0 && age <= detection_stale_s_;
+        };
+
+        bool found = false;
+        // ① 先倒车：跨车改派时落点可能偏差接近一米，车头会顶到目标上，
+        //    贴得太近时 0.2 m 的物块落在相机视野外，怎么转都看不见
+        const rclcpp::Time back_start = now();
+        while (rclcpp::ok() && !found &&
+               (now() - back_start).seconds() < kSearchBackoffSec) {
+          if (handle->is_canceling()) {
+            StopRobot();
+            failure_reason_ = kReasonCanceled;
+            failure_detail_ = "搜索中被取消";
+            return false;
+          }
+          PublishCmd(-kSearchBackoffVel, 0.0);
+          found = visible();
+          rclcpp::sleep_for(period);
+        }
+        // ② 再原地转一圈：目标可能在车的侧后方
+        const rclcpp::Time search_start = now();
+        while (rclcpp::ok() && !found &&
+               (now() - search_start).seconds() < kSearchBudgetSec) {
+          if (handle->is_canceling()) {
+            StopRobot();
+            failure_reason_ = kReasonCanceled;
+            failure_detail_ = "搜索中被取消";
+            return false;
+          }
+          PublishCmd(0.0, kSearchYawRate);
+          found = visible();
+          rclcpp::sleep_for(period);
+        }
+        StopRobot();
+        if (!found) {
+          failure_reason_ = kReasonTargetLost;
+          failure_detail_ = "到达对位位置后倒车+搜索一圈仍未发现目标";
+          return false;
+        }
+        RCLCPP_INFO(get_logger(), "搜索到目标，重新开始对位");
+        dock_->Reset(NowNs());
+        ever_seen = true;
+        continue;
       }
 
       const DockingOutput out = dock_->Update(in, NowNs());
