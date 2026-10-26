@@ -1,6 +1,7 @@
 #include "fleet_gui/ros_bridge.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <utility>
 
 namespace fleet::gui {
@@ -243,6 +244,13 @@ void MonitorNode::SubscribeRobot(const std::string& robot)
       if (hub_->cameraRobot().toStdString() != robot) {
         return;   // 只解码当前选中的相机
       }
+      const auto now = std::chrono::steady_clock::now().time_since_epoch();
+      const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+      const auto last = last_camera_emit_ms_.find(robot);
+      if (last != last_camera_emit_ms_.end() && now_ms - last->second < 66) {
+        return;   // GUI 最高约 15 FPS，避免高帧率相机压垮 Qt 主线程
+      }
+      last_camera_emit_ms_[robot] = now_ms;
       const QImage image = ToQImage(*msg);
       if (!image.isNull()) {
         emit hub_->cameraFrame(QString::fromStdString(robot), image);

@@ -15,7 +15,8 @@ namespace fleet {
 struct WatchdogConfig {
   TimeNs nav_timeout{60 * kSecond};      // NAVIGATING 阶段的超时
   TimeNs dock_timeout{30 * kSecond};     // DOCKING 阶段的超时
-  TimeNs assign_timeout{30 * kSecond};   // PENDING 等待分配的超时
+  TimeNs assigned_timeout{10 * kSecond}; // ASSIGNED 等待 agent 确认的超时
+  TimeNs assign_timeout{180 * kSecond};  // PENDING 等待分配的超时
   TimeNs heartbeat_timeout{3 * kSecond}; // 心跳超过此值视为离线
 };
 

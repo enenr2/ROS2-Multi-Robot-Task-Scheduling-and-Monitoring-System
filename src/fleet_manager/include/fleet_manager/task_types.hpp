@@ -77,6 +77,9 @@ struct Task {
   TimeNs assigned_at{0};
 
   TimeNs detected_at{0};
+  // 当前这一轮处于 PENDING 的起始时间；重排时刷新，避免用首次发现时间
+  // 误触发派单超时。detected_at 只用于端到端耗时统计。
+  TimeNs pending_since{0};
   // 进入终态的时间；重排回 PENDING 时清零。用于终态任务的保留/清理策略
   TimeNs finished_at{0};
   uint8_t retry_count{0};

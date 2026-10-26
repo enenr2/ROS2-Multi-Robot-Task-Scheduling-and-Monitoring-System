@@ -10,6 +10,10 @@ bool Watchdog::IsTaskTimedOut(const Task& t, TimeNs now, TimeoutEvent* out) cons
   const char* reason = "";
 
   switch (t.state) {
+    case TaskState::kAssigned:
+      deadline = t.assigned_at + cfg_.assigned_timeout;
+      reason = "GOAL_ACK_TIMEOUT";
+      break;
     case TaskState::kNavigating:
       // NAVIGATING 的计时起点是分配到车的那一刻
       deadline = t.assigned_at + cfg_.nav_timeout;
@@ -21,13 +25,20 @@ bool Watchdog::IsTaskTimedOut(const Task& t, TimeNs now, TimeoutEvent* out) cons
       deadline = t.assigned_at + cfg_.dock_timeout;
       reason = "DOCK_TIMEOUT";
       break;
-    case TaskState::kPending:
+    case TaskState::kPending: {
       // 一直没人可派：从检测到目标的时间起算
-      deadline = t.detected_at + cfg_.assign_timeout;
+      const TimeNs pending_since = t.pending_since > 0 ? t.pending_since : t.detected_at;
+      if (pending_since <= 0) {
+        // 缺少创建时间说明任务数据不完整，不能把 Unix/稳态时钟的
+        // 当前值当成已超时，避免产生无法收敛的重复告警。
+        return false;
+      }
+      deadline = pending_since + cfg_.assign_timeout;
       reason = "ASSIGN_TIMEOUT";
       break;
+    }
     default:
-      return false;   // ASSIGNED 阶段很短，由 ASSIGNED->NAVIGATING 的推进兜住
+      return false;
   }
 
   if (t.assigned_at == 0 && t.state != TaskState::kPending) {
@@ -40,7 +51,8 @@ bool Watchdog::IsTaskTimedOut(const Task& t, TimeNs now, TimeoutEvent* out) cons
   }
 
   if (out != nullptr) {
-    out->kind = TimeoutKind::kTask;
+    out->kind = t.state == TaskState::kPending ? TimeoutKind::kAssign
+                                                : TimeoutKind::kTask;
     out->task_id = t.id;
     out->robot_id.clear();
     out->state_at_timeout = t.state;

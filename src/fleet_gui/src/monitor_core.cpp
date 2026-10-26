@@ -95,6 +95,7 @@ std::string ReasonText(const std::string& reason)
     {"ROBOT_UNREACHABLE", "机器人失联"},
     {"CANCELED_BY_OPERATOR", "操作员取消"},
     {"ASSIGN_TIMEOUT", "派单超时"},
+    {"GOAL_ACK_TIMEOUT", "执行代理确认超时"},
     {"GOAL_REJECTED", "目标被拒绝"},
     {"AGENT_FAILED", "执行失败"},
     {"UNKNOWN_TASK", "未知任务"},

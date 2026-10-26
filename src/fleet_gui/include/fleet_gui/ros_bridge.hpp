@@ -91,6 +91,7 @@ private:
 
   std::set<std::string> robots_;
   std::map<std::string, RobotSubs> subs_;
+  std::map<std::string, int64_t> last_camera_emit_ms_;
   rclcpp::TimerBase::SharedPtr discovery_timer_;
 
   rclcpp::Subscription<fleet_msgs::msg::Task>::SharedPtr task_sub_;

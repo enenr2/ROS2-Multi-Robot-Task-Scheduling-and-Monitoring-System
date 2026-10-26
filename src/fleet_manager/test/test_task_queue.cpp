@@ -24,6 +24,7 @@ TEST(TaskQueue, AddNewTask)
   EXPECT_EQ(t->color, Color::kRed);
   EXPECT_EQ(t->retry_count, 0);
   EXPECT_TRUE(t->assigned_robot.empty());
+  EXPECT_EQ(t->pending_since, kT0);
   EXPECT_EQ(t->revision, 1u) << "创建即算一次变更";
   EXPECT_EQ(q.Size(), 1u);
 }
@@ -256,6 +257,7 @@ TEST(TaskQueue, RetryKeepsQuotaThenFails)
   EXPECT_EQ(q.Find("t1")->retry_count, 1);
   EXPECT_TRUE(q.Find("t1")->assigned_robot.empty());
   EXPECT_EQ(q.Find("t1")->assigned_at, 0) << "重排后旧分配时间必须清掉";
+  EXPECT_EQ(q.Find("t1")->pending_since, kT0) << "首次重排时间应作为新一轮派单起点";
   EXPECT_EQ(q.Find("t1")->failure_reason, "NAV_TIMEOUT");
 
   // 第二次重排：配额用尽，终态 FAILED
@@ -265,6 +267,19 @@ TEST(TaskQueue, RetryKeepsQuotaThenFails)
   EXPECT_EQ(q.Find("t1")->state, TaskState::kFailed);
   EXPECT_EQ(q.Find("t1")->retry_count, 1) << "终态失败不再增加重试计数";
   EXPECT_EQ(q.Find("t1")->failure_reason, "NAV_TIMEOUT");
+}
+
+TEST(TaskQueue, RetryRefreshesPendingTimeoutStart)
+{
+  TaskQueue q;
+  ASSERT_TRUE(q.AddTask("t1", Color::kRed, P(0.0, 0.0), kT0));
+  ASSERT_TRUE(q.AssignTo("t1", "robot1", kT0));
+  ASSERT_TRUE(q.Transition("t1", TaskState::kNavigating, kT0));
+
+  const TimeNs retry_at = kT0 + 45 * kSecond;
+  ASSERT_TRUE(q.RetryOrFail("t1", retry_at, "NAV_TIMEOUT"));
+  EXPECT_EQ(q.Find("t1")->detected_at, kT0);
+  EXPECT_EQ(q.Find("t1")->pending_since, retry_at);
 }
 
 TEST(TaskQueue, FailedTaskCanRetryBeforeQuotaExhausted)

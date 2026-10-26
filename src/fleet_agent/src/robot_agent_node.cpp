@@ -20,6 +20,9 @@
 #include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <tf2/time.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include <algorithm>
 #include <array>
@@ -105,10 +108,27 @@ public:
     }
 
     world_frame_ = declare_parameter<std::string>("world_frame", "map");
+    // 位姿统一从 TF 取 map -> <base_frame>：odom 帧等于出生点起的轮速积分，
+    // 与 map 之间还差一个 AMCL 修正量，直接上报 odom 会让监控端/调度端整体平移。
+    base_frame_ = declare_parameter<std::string>("base_frame", "");
+    if (base_frame_.empty()) {
+      base_frame_ = robot_id_ + "_base_footprint";
+    }
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(
+      *tf_buffer_,
+      tf2_ros::TransformListener::RequiredInterfaces(
+        get_node_base_interface(), get_node_logging_interface(),
+        get_node_parameters_interface(), get_node_topics_interface()),
+      true);
     standoff_default_ = ResolveStandoff(0.0, declare_parameter<double>("standoff", 0.6));
     pre_dock_margin_ = declare_parameter<double>("pre_dock_margin", 0.8);
     nav_timeout_s_ = declare_parameter<double>("nav_timeout", 90.0);
-    const auto detection_stale_ms = declare_parameter<int>("detection_stale_ms", 1000);
+    if (!std::isfinite(nav_timeout_s_) || nav_timeout_s_ <= 0.0) {
+      RCLCPP_WARN(get_logger(), "nav_timeout 非法，回退到 90s");
+      nav_timeout_s_ = 90.0;
+    }
+    const auto detection_stale_ms = declare_parameter<int>("detection_stale_ms", 2000);
 
     DockingConfig dock_cfg;
     dock_cfg.standoff = standoff_default_;
@@ -116,11 +136,24 @@ public:
     dock_cfg.bearing_tolerance = declare_parameter<double>("bearing_tolerance", 0.05);
     dock_cfg.max_linear_vel = declare_parameter<double>("max_linear_vel", 0.15);
     dock_cfg.max_yaw_rate = declare_parameter<double>("max_yaw_rate", 0.5);
-    dock_cfg.target_lost_timeout_s = declare_parameter<double>("target_lost_timeout", 3.0);
-    dock_cfg.timeout_s = declare_parameter<double>("dock_timeout", 20.0);
+    dock_cfg.target_lost_timeout_s = declare_parameter<double>("target_lost_timeout", 5.0);
+    dock_cfg.timeout_s = declare_parameter<double>("dock_timeout", 45.0);
+    if (!std::isfinite(dock_cfg.target_lost_timeout_s) ||
+        dock_cfg.target_lost_timeout_s <= 0.0) {
+      dock_cfg.target_lost_timeout_s = 5.0;
+    }
+    if (!std::isfinite(dock_cfg.timeout_s) || dock_cfg.timeout_s <= 0.0) {
+      dock_cfg.timeout_s = 45.0;
+    }
+    if (!std::isfinite(dock_cfg.max_linear_vel) || dock_cfg.max_linear_vel <= 0.0) {
+      dock_cfg.max_linear_vel = 0.15;
+    }
+    if (!std::isfinite(dock_cfg.max_yaw_rate) || dock_cfg.max_yaw_rate <= 0.0) {
+      dock_cfg.max_yaw_rate = 0.5;
+    }
     dock_ = std::make_unique<DockingController>(dock_cfg);
 
-    detection_stale_s_ = static_cast<double>(detection_stale_ms) / 1000.0;
+    detection_stale_s_ = std::max(0.1, static_cast<double>(detection_stale_ms) / 1000.0);
 
     // 订阅与定时器放独立组：execute 回调阻塞时它们仍要能被调度
     sensor_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -200,8 +233,34 @@ public:
 private:
   // ---------------- 回调 ----------------
 
+  // 取 map 系下的实时位姿。odom 只是轮速积分，和 map 之间差着 AMCL 的修正量，
+  // 所以对外上报与任务起点判断都必须用 TF。
+  bool LookupMapPose(Pose2D* pose, std::string* error)
+  {
+    if (!tf_buffer_) {
+      if (error != nullptr) {
+        *error = "TF 缓冲区未初始化";
+      }
+      return false;
+    }
+    try {
+      const auto tf = tf_buffer_->lookupTransform(
+        world_frame_, base_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      pose->x = tf.transform.translation.x;
+      pose->y = tf.transform.translation.y;
+      pose->yaw = YawFromQuaternion(tf.transform.rotation);
+      return true;
+    } catch (const tf2::TransformException& ex) {
+      if (error != nullptr) {
+        *error = ex.what();
+      }
+      return false;
+    }
+  }
+
   void OnOdom(const nav_msgs::msg::Odometry& msg)
   {
+    // 兜底数据源：odom 是出生点起的轮速积分，只有 TF 不可用时才拿来顶一下
     std::lock_guard<std::mutex> lock(mutex_);
     pose_.x = msg.pose.pose.position.x;
     pose_.y = msg.pose.pose.position.y;
@@ -216,8 +275,11 @@ private:
     }
     std::lock_guard<std::mutex> lock(mutex_);
     auto& slot = detections_[msg.color];
-    if (msg.lost || msg.range <= 0.0f) {
+    if (msg.lost) {
       slot.has = false;
+      return;
+    }
+    if (!std::isfinite(msg.bearing) || !std::isfinite(msg.range) || msg.range <= 0.0f) {
       return;
     }
     slot.has = true;
@@ -259,13 +321,22 @@ private:
 
     // ---- 起点检查 ----
     Pose2D robot_pose;
-    {
+    std::string pose_error;
+    if (LookupMapPose(&robot_pose, &pose_error)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pose_ = robot_pose;   // 顺手刷新，心跳线程也用它
+      has_pose_ = true;
+    } else {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!has_pose_) {
-        Finish(handle, result, Outcome::kFailed, kReasonUnreachable, "收不到里程计，无法定位");
+        Finish(handle, result, Outcome::kFailed, kReasonUnreachable,
+               "收不到定位（TF " + world_frame_ + " -> " + base_frame_ + "：" +
+                 pose_error + "，且无里程计）");
         return;
       }
       robot_pose = pose_;
+      RCLCPP_WARN(get_logger(), "TF %s -> %s 暂不可用（%s），先用最近一次位姿开始任务",
+                  world_frame_.c_str(), base_frame_.c_str(), pose_error.c_str());
     }
 
     Pose2D target;
@@ -350,7 +421,7 @@ private:
     PublishTaskStatus(TaskState::kNavigating, 0.1, "导航前往目标附近");
 
     const double start_distance = std::max(approach.distance_to_target - approach_distance, 0.0);
-    const rclcpp::Time nav_start = now();
+    const TimeNs nav_start = NowNs();
     auto result_future = nav_client_->async_get_result(nav_handle);
 
     while (result_future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
@@ -360,7 +431,8 @@ private:
         failure_detail_ = "导航中被取消";
         return false;
       }
-      const double elapsed = (now() - nav_start).seconds();
+      const double elapsed = static_cast<double>(NowNs() - nav_start) /
+                             static_cast<double>(kSec);
       if (elapsed > nav_timeout_s_) {
         nav_client_->async_cancel_goal(nav_handle);
         failure_reason_ = kReasonNavTimeout;
@@ -404,7 +476,7 @@ private:
     double start_range = -1.0;
     bool ever_seen = false;
     const auto period = std::chrono::milliseconds(100);
-    const rclcpp::Time dock_start = now();
+    TimeNs dock_start = NowNs();
     // 进入对位前的检测不算数：导航途中看到过目标，不代表到了对位点还能看到
     const TimeNs dock_start_ns = NowNs();
 
@@ -432,7 +504,9 @@ private:
       // 到了预定位置却始终没看到目标：多半是任务改派时沿用了上一台车报的
       // 世界坐标，两台车的里程计漂移不同，落点会差出半米到一米。原地转一圈
       // 把目标找回来再对位，比直接判 TARGET_LOST 更符合实际系统
-      if (!in.target_visible && !ever_seen && (now() - dock_start).seconds() > 1.5) {
+      const double dock_elapsed = static_cast<double>(NowNs() - dock_start) /
+                                  static_cast<double>(kSec);
+      if (!in.target_visible && !ever_seen && dock_elapsed > 1.5) {
         RCLCPP_INFO(get_logger(), "到达对位位置后未见目标，先倒车再原地搜索");
         PublishTaskStatus(TaskState::kDocking, 0.6, "目标不在视野，倒车搜索");
         auto visible = [this, color]() {
@@ -446,9 +520,10 @@ private:
         bool found = false;
         // ① 先倒车：跨车改派时落点可能偏差接近一米，车头会顶到目标上，
         //    贴得太近时 0.2 m 的物块落在相机视野外，怎么转都看不见
-        const rclcpp::Time back_start = now();
+        const TimeNs back_start = NowNs();
         while (rclcpp::ok() && !found &&
-               (now() - back_start).seconds() < kSearchBackoffSec) {
+               static_cast<double>(NowNs() - back_start) / static_cast<double>(kSec) <
+               kSearchBackoffSec) {
           if (handle->is_canceling()) {
             StopRobot();
             failure_reason_ = kReasonCanceled;
@@ -460,9 +535,10 @@ private:
           rclcpp::sleep_for(period);
         }
         // ② 再原地转一圈：目标可能在车的侧后方
-        const rclcpp::Time search_start = now();
+        const TimeNs search_start = NowNs();
         while (rclcpp::ok() && !found &&
-               (now() - search_start).seconds() < kSearchBudgetSec) {
+               static_cast<double>(NowNs() - search_start) / static_cast<double>(kSec) <
+               kSearchBudgetSec) {
           if (handle->is_canceling()) {
             StopRobot();
             failure_reason_ = kReasonCanceled;
@@ -480,7 +556,8 @@ private:
           return false;
         }
         RCLCPP_INFO(get_logger(), "搜索到目标，重新开始对位");
-        dock_->Reset(NowNs());
+        dock_start = NowNs();
+        dock_->Reset(dock_start);
         ever_seen = true;
         continue;
       }
@@ -525,7 +602,8 @@ private:
       }
 
       // 用节点时钟统计超时更稳，顺便记录真实耗时
-      if ((now() - dock_start).seconds() > dock_->config().timeout_s * 2.0) {
+      if (static_cast<double>(NowNs() - dock_start) / static_cast<double>(kSec) >
+          dock_->config().timeout_s * 2.0) {
         StopRobot();
         failure_reason_ = kReasonDockTimeout;
         failure_detail_ = "对位超时";
@@ -660,6 +738,21 @@ private:
       current_task = current_task_;
     }
 
+    // 对外一律上报 map 系位姿；TF 还没建好时先退回里程计并告警，
+    // 否则监控端/调度端会看到整车平移一个 map->odom 的量。
+    Pose2D map_pose;
+    std::string tf_error;
+    if (LookupMapPose(&map_pose, &tf_error)) {
+      pose = map_pose;
+      std::lock_guard<std::mutex> lock(mutex_);
+      pose_ = map_pose;
+      has_pose_ = true;
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "TF %s -> %s 不可用，心跳位姿暂用里程计: %s",
+                           world_frame_.c_str(), base_frame_.c_str(), tf_error.c_str());
+    }
+
     fleet_msgs::msg::RobotStatus msg;
     msg.robot_id = robot_id_;
     msg.state = busy_ ? fleet_msgs::msg::RobotStatus::STATE_BUSY
@@ -679,7 +772,11 @@ private:
 
   TimeNs NowNs()
   {
-    return now().nanoseconds();
+    // 统一用 ROS 时钟（仿真下即 sim time）。导航/对位/搜索的预算都是
+    // "机器人运动多少时间"，必须和运动本身同一时间基准：5 车时 RTF 只有 ~0.3，
+    // 用墙钟会把"原地转一圈"压缩成几十度，目标自然就丢了。
+    // 真机上 use_sim_time=false，这里等价于系统时间，行为不变。
+    return get_clock()->now().nanoseconds();
   }
 
   struct LatestDetection {
@@ -691,6 +788,7 @@ private:
 
   std::string robot_id_;
   std::string world_frame_;
+  std::string base_frame_;
   double standoff_default_{0.6};
   double pre_dock_margin_{0.8};
   double nav_timeout_s_{90.0};
@@ -698,6 +796,10 @@ private:
 
   std::unique_ptr<DockingController> dock_;
   std::unique_ptr<CmdVelLink> cmd_link_;
+
+  // 位姿来源：TF map -> base_footprint（监听器自带独立线程，不占执行器）
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   std::mutex mutex_;
   Pose2D pose_;

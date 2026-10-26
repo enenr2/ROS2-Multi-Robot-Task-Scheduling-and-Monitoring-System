@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/enenr2/ROS2-Multi-Robot-Task-Scheduling-and-Monitoring-System/actions/workflows/ci.yml/badge.svg)](https://github.com/enenr2/ROS2-Multi-Robot-Task-Scheduling-and-Monitoring-System/actions/workflows/ci.yml)
 
-两台 TurtleBot3 在 Gazebo 中自主作业：**视觉发现彩色目标 → 调度分配任务 → Nav2 导航到目标附近 → 视觉闭环精对位停车**，全过程通过话题与 action 可观测、可回放。
+默认两台、可扩展至五台 TurtleBot3 在 Gazebo 中自主作业：**视觉发现彩色目标 → 调度分配任务 → Nav2 导航到目标附近 → 视觉闭环精对位停车**，全过程通过话题与 action 可观测、可回放。
 
 不同于只展示 3D 模型的仿真项目，本仓库的重点在工程细节：多机命名空间隔离、TF 树统一、接口版本化、纯逻辑单测、跨节点集成测试、故障注入与状态可观测。
 
@@ -23,7 +23,7 @@
  /robotN/imu             /robotN/camera/camera_info     /robotN/cmd_vel
       │                           │                            │
       ▼                           ▼                            ▼
- 里程计 / TF              fleet_perception          Nav2 (robot1 + robot2)
+ 里程计 / TF              fleet_perception          Nav2 (robot1 ... robotN)
   + AMCL 定位              HSV 分割 + 单目测距        navigate_to_pose
                           + 时序去抖                          │
                               │                               │
@@ -54,7 +54,7 @@
 
 任务执行三段式：**导航**（Nav2 负责全局路径与避障，终点退到目标前 1.4 m 并让车头对准目标）→ **对位**（视觉闭环把航向收进 0.05 rad、距离收到 standoff 0.6 m）→ **收尾**（停车、发终态）。
 
-定位：每台车跑一套 **AMCL**（`/robotN/scan` + 全局 `/map`），由 AMCL 发布 `map → robotN_odom`。gz 的里程计是轮速积分，实测跑十几米会漂 1~3 m；不用 AMCL 时两台车各漂各的，任务改派后新车按旧车报的世界坐标导航会停偏一两米。
+定位：每台车跑一套 **AMCL**（`/robotN/scan` + 全局 `/map`），由 AMCL 发布 `map → robotN_odom`。gz 的里程计是轮速积分，实测跑十几米会漂 1~3 m；不用 AMCL 时各车会分别漂移，任务改派后新车按旧车报的世界坐标导航会停偏一两米。
 
 ---
 
@@ -63,7 +63,7 @@
 | 包 | 职责 | 状态 | 测试 |
 |---|---|---|---|
 | `fleet_msgs` | 接口层：4 个 msg、2 个 srv、1 个 action | 完成 | — |
-| `fleet_bringup` | 仿真底座：自建世界/地图/机器人模型、双 Nav2 + 双 AMCL、桥接配置、RViz、一键 launch | 完成 | — |
+| `fleet_bringup` | 仿真底座：自建世界/地图/机器人模型、每车一套 Nav2 + AMCL、动态桥接配置、桥接配置、RViz、一键 launch | 完成 | — |
 | `fleet_manager` | 调度：状态机、任务队列、分配策略、看门狗、失败冷却、终态任务保留 + ROS 适配节点 | 完成 | 54 gtest |
 | `fleet_perception` | 感知：HSV 颜色识别、单目测距、时序去抖、TF 转世界系 | 完成 | 28 gtest |
 | `fleet_agent` | 执行代理：封装 Nav2、视觉精对位、状态与心跳、安全停车 | 完成 | 21 gtest |
@@ -119,7 +119,7 @@ source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 
-# 3. 一键启动：双机 + 地图 + 桥 + Nav2 + 感知 + 执行代理 + RViz + Qt 监控台
+# 3. 默认双机：地图 + 桥 + Nav2 + 感知 + 执行代理 + RViz + Qt 监控台
 ros2 launch fleet_bringup fleet_sim.launch.py gui:=false rviz:=true monitor:=true
 
 # 或单独开监控台（仿真已在跑时）
@@ -132,6 +132,25 @@ docker compose up monitor      # 需要图形会话
 ```
 
 常用开关：`gui:=false|true`、`rviz:=false|true`、`nav2:=false|true`、`perception:=false|true`、`agent:=false|true`、`manager:=false|true`、`monitor:=false|true`。
+
+### 3–5 台压测
+
+`robot_count` 可配置 1–5 台；launch 会为每台车生成独立的 SDF、桥接项、TF 前缀、Nav2 参数与 agent。三台完整仿真建议关闭 GUI/RViz/Qt；五台建议同样 headless，并关闭感知或降低传感器频率后再测 Nav2 调度吞吐。
+
+```bash
+# 三台端到端仿真与冒烟
+ros2 launch fleet_bringup fleet_sim.launch.py robot_count:=3 gui:=false rviz:=false monitor:=false
+python3 scripts/smoke_sim.py --robot-count 3 --timeout 240
+
+# 五台调度/导航压测（headless）
+ros2 launch fleet_bringup fleet_sim.launch.py robot_count:=5 gui:=false rviz:=false monitor:=false
+python3 scripts/smoke_sim.py --robot-count 5 --timeout 360 --boot-timeout 240
+```
+
+也可用 `robots:=alpha,beta,gamma` 指定 ID。五台完整相机与 AMCL 会明显增加 CPU、内存、DDS 和 Gazebo 渲染负载；压测前记录主机资源，并优先关闭 `gui`、`rviz`、`monitor` 与不需要的 `perception`。
+
+调度器还会对已派单但未收到 agent 确认的任务执行 `assigned_timeout`（默认 10 秒）保护，
+超时后按 `GOAL_ACK_TIMEOUT` 取消并重排，避免通信中断时任务永久停留在 `ASSIGNED`。
 
 停仿真用 `./scripts/stop_sim.sh`：会 SIGTERM → 超时 SIGKILL，并清理 `/dev/shm/fastdds_*`。不要用 `pkill -f` 手工杀，卡在生命周期过渡的 Nav2 节点会忽略 SIGTERM 并残留成"同名僵尸节点"，下一次启动时生命周期管理器会卡住。
 
@@ -186,7 +205,7 @@ python3 scripts/smoke_sim.py --timeout 200
 | A 机器人离线 | `SIGSTOP` 该车 `robot_agent` | 心跳超时 → `ROBOT_UNREACHABLE` → 改派 | 改派后完成 |
 | B 任务超时 | 在线把 `nav_timeout` 缩到 2 s | 看门狗 `NAV_TIMEOUT` → 取消 → 改派 | 改派后完成 |
 | C 导航栈卡死 | `SIGSTOP` 该车 `controller_server` | `NAV_ABORTED` → 改派（该车 Nav2 整栈下线，不会自愈） | 改派后完成 |
-| D 目标丢失 | 对位阶段把物块移出视野 | agent 报 `TARGET_LOST` → 重试一次 | 重试用尽 `FAILED` |
+| D 目标丢失 | 对位阶段把物块移出视野 | agent 报 `TARGET_LOST` → 按重试配额（默认 3 次）改派 | 重试用尽 `FAILED` |
 
 > C 会让故障车的 Nav2 被 lifecycle bond 判死并 deactivate，这是真实的"导航栈需要人工介入"，所以放在最后跑。四个场景建议逐个重启仿真，避免上一轮的里程计/任务残局影响判断。
 
@@ -444,6 +463,3 @@ Fast DDS Discovery Server 跨主机部署、任务数上千时的增量式监控
 
 ---
 
-## 作者
-
-赵威（enenr2） — 2027 届计算机科学与技术，方向：机器人上位机 / ROS2 系统集成。

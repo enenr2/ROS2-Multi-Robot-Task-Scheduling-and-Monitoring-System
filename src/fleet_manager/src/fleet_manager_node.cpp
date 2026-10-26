@@ -1,7 +1,9 @@
 #include "fleet_manager_node.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,33 @@ bool IsTerminalState(TaskState s)
 {
   return s == TaskState::kDone || s == TaskState::kFailed ||
          s == TaskState::kCanceled;
+}
+
+bool IsFinite(double value)
+{
+  return std::isfinite(value);
+}
+
+bool IsFinitePose(const geometry_msgs::msg::Pose& pose)
+{
+  const auto& p = pose.position;
+  const auto& q = pose.orientation;
+  if (!IsFinite(p.x) || !IsFinite(p.y) || !IsFinite(p.z) ||
+      !IsFinite(q.x) || !IsFinite(q.y) || !IsFinite(q.z) || !IsFinite(q.w)) {
+    return false;
+  }
+  const double norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+  return norm > std::numeric_limits<double>::epsilon();
+}
+
+double PositiveSeconds(double value, double fallback)
+{
+  return IsFinite(value) && value > 0.0 ? value : fallback;
+}
+
+double NonNegativeSeconds(double value, double fallback)
+{
+  return IsFinite(value) && value >= 0.0 ? value : fallback;
 }
 
 Color ToCoreColor(uint8_t c)
@@ -82,7 +111,7 @@ FleetManagerNode::FleetManagerNode()
   queue_([] {
     TaskQueueConfig cfg;
     cfg.dedup_radius = 0.8;          // 同一物块被两台车从不同视角估计，位置会差几十厘米
-    cfg.default_max_retries = 1;
+    cfg.default_max_retries = 3;     // 运行时由 max_retries 参数覆盖
     return cfg;
   }()),
   assignment_([] {
@@ -96,10 +125,13 @@ FleetManagerNode::FleetManagerNode()
     // 避免和 agent 抢着判失败；运行时可用参数调小，供故障注入使用
     // dock_timeout 是"从派单到对位结束"的总预算（fleet_core 的实现口径），
     // 必须大于 nav_timeout，否则导航稍慢一点就永远没机会进入对位
-    cfg.nav_timeout = 100 * kSecond;
-    cfg.dock_timeout = 150 * kSecond;
-    cfg.assign_timeout = 30 * kSecond;
-    cfg.heartbeat_timeout = 3 * kSecond;
+    cfg.nav_timeout = 165 * kSecond;
+    cfg.dock_timeout = 220 * kSecond;
+    cfg.assigned_timeout = 10 * kSecond;
+    cfg.assign_timeout = 180 * kSecond;
+    // 心跳 1 Hz，3 s 在多车 + 相机 + 软件渲染的场景里一被调度抖动就会误判离线，
+    // 离线又会立刻把该车的任务判失败，所以放宽到 8 s
+    cfg.heartbeat_timeout = 8 * kSecond;
     return cfg;
   }())
 {
@@ -108,34 +140,47 @@ FleetManagerNode::FleetManagerNode()
   dispatch_ids_ = declare_parameter<std::vector<std::string>>(
     "dispatch_robot_ids", std::vector<std::string>{"robot1"});
   const double requested_standoff = declare_parameter<double>("standoff", 0.6);
-  standoff_ = std::clamp(requested_standoff, kMinStandoff, kMaxStandoff);
+  const double safe_standoff = IsFinite(requested_standoff) ? requested_standoff : 0.6;
+  standoff_ = std::clamp(safe_standoff, kMinStandoff, kMaxStandoff);
   if (std::abs(standoff_ - requested_standoff) > 1e-9) {
     RCLCPP_WARN(get_logger(), "standoff 超出 [%.2f, %.2f]，已限制到 %.2f",
                 kMinStandoff, kMaxStandoff, standoff_);
   }
   publish_markers_ = declare_parameter<bool>("publish_markers", true);
 
+  // 重试预算：多车场景下导航偶发超时、被避障卡住很常见，
+  // 一次失败就置 FAILED 会让任务成功率明显偏低。默认 3 次重排（最多执行 4 次）
+  const int max_retries = declare_parameter<int>("max_retries", 3);
+  if (max_retries < 0 || max_retries > 9) {
+    RCLCPP_WARN(get_logger(), "max_retries=%d 超出 [0, 9]，将按边界值处理", max_retries);
+  }
+
   // 终态任务保留策略：不清理会让内存和监控快照无限增长，
   // 也会让"同色目标再次出现"被历史任务挡住
   TaskQueueConfig queue_cfg = queue_.config();
+  queue_cfg.default_max_retries = static_cast<uint8_t>(std::clamp(max_retries, 0, 9));
   queue_cfg.retention_age = static_cast<TimeNs>(
-    declare_parameter<double>("retention_age", 600.0) * kSecond);
-  queue_cfg.max_terminal = static_cast<std::size_t>(
-    declare_parameter<int>("retention_max_tasks", 500));
+    NonNegativeSeconds(declare_parameter<double>("retention_age", 600.0), 600.0) * kSecond);
+  const int retention_max_tasks = declare_parameter<int>("retention_max_tasks", 500);
+  queue_cfg.max_terminal = static_cast<std::size_t>(std::max(0, retention_max_tasks));
   queue_.set_config(queue_cfg);
 
   // 看门狗时限做成参数：正常运行时是兜底，故障注入/调参时可以在线缩短
   WatchdogConfig wd;
-  wd.nav_timeout = static_cast<TimeNs>(declare_parameter<double>("nav_timeout", 100.0) * kSecond);
-  wd.dock_timeout = static_cast<TimeNs>(declare_parameter<double>("dock_timeout", 150.0) * kSecond);
+  wd.nav_timeout = static_cast<TimeNs>(
+    PositiveSeconds(declare_parameter<double>("nav_timeout", 165.0), 165.0) * kSecond);
+  wd.dock_timeout = static_cast<TimeNs>(
+    PositiveSeconds(declare_parameter<double>("dock_timeout", 220.0), 220.0) * kSecond);
+  wd.assigned_timeout = static_cast<TimeNs>(
+    PositiveSeconds(declare_parameter<double>("assigned_timeout", 10.0), 10.0) * kSecond);
   wd.assign_timeout =
-    static_cast<TimeNs>(declare_parameter<double>("assign_timeout", 30.0) * kSecond);
+    static_cast<TimeNs>(PositiveSeconds(declare_parameter<double>("assign_timeout", 180.0), 180.0) * kSecond);
   wd.heartbeat_timeout =
-    static_cast<TimeNs>(declare_parameter<double>("heartbeat_timeout", 3.0) * kSecond);
+    static_cast<TimeNs>(PositiveSeconds(declare_parameter<double>("heartbeat_timeout", 8.0), 8.0) * kSecond);
   watchdog_cfg_ = wd;
   watchdog_ = Watchdog(wd);
   cooldown_ns_ = static_cast<TimeNs>(
-    declare_parameter<double>("retry_cooldown", 10.0) * kSecond);
+    NonNegativeSeconds(declare_parameter<double>("retry_cooldown", 10.0), 10.0) * kSecond);
 
   // 允许在线调整超时：故障注入要能把"导航卡死多久算超时"缩短到十几秒，
   // 否则一次注入得等 100 s 才看得到看门狗动作
@@ -146,16 +191,60 @@ FleetManagerNode::FleetManagerNode()
       WatchdogConfig cfg = watchdog_cfg_;
       for (const auto& p : params) {
         const auto name = p.get_name();
-        if (name == "nav_timeout") {
-          cfg.nav_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
-        } else if (name == "dock_timeout") {
-          cfg.dock_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
-        } else if (name == "assign_timeout") {
-          cfg.assign_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
-        } else if (name == "heartbeat_timeout") {
-          cfg.heartbeat_timeout = static_cast<TimeNs>(p.as_double() * kSecond);
-        } else if (name == "retry_cooldown") {
-          cooldown_ns_ = static_cast<TimeNs>(p.as_double() * kSecond);
+        if (name == "nav_timeout" || name == "dock_timeout" || name == "assigned_timeout" ||
+            name == "assign_timeout" || name == "heartbeat_timeout" || name == "retry_cooldown") {
+          const double value = p.as_double();
+          const bool non_negative = name == "retry_cooldown";
+          if (!IsFinite(value) || (non_negative ? value < 0.0 : value <= 0.0)) {
+            result.successful = false;
+            result.reason = name + " must be finite and " +
+              std::string(non_negative ? "non-negative" : "positive");
+            return result;
+          }
+          const TimeNs duration = static_cast<TimeNs>(value * kSecond);
+          if (name == "nav_timeout") {
+            cfg.nav_timeout = duration;
+          } else if (name == "dock_timeout") {
+            cfg.dock_timeout = duration;
+          } else if (name == "assigned_timeout") {
+            cfg.assigned_timeout = duration;
+          } else if (name == "assign_timeout") {
+            cfg.assign_timeout = duration;
+          } else if (name == "heartbeat_timeout") {
+            cfg.heartbeat_timeout = duration;
+          } else {
+            cooldown_ns_ = duration;
+          }
+        } else if (name == "max_retries") {
+          const int value = p.as_int();
+          if (value < 0 || value > 9) {
+            result.successful = false;
+            result.reason = "max_retries must be in [0, 9]";
+            return result;
+          }
+          auto queue_cfg = queue_.config();
+          queue_cfg.default_max_retries = static_cast<uint8_t>(value);
+          queue_.set_config(queue_cfg);
+        } else if (name == "retention_age") {
+          const double value = p.as_double();
+          if (!IsFinite(value) || value < 0.0) {
+            result.successful = false;
+            result.reason = "retention_age must be finite and non-negative";
+            return result;
+          }
+          auto queue_cfg = queue_.config();
+          queue_cfg.retention_age = static_cast<TimeNs>(value * kSecond);
+          queue_.set_config(queue_cfg);
+        } else if (name == "retention_max_tasks") {
+          const int value = p.as_int();
+          if (value < 0) {
+            result.successful = false;
+            result.reason = "retention_max_tasks must be non-negative";
+            return result;
+          }
+          auto queue_cfg = queue_.config();
+          queue_cfg.max_terminal = static_cast<std::size_t>(value);
+          queue_.set_config(queue_cfg);
         }
       }
       watchdog_cfg_ = cfg;
@@ -204,15 +293,20 @@ FleetManagerNode::FleetManagerNode()
   // 0.5 s 一拍：既做超时判定，也做待分配任务的推进
   tick_timer_ = create_wall_timer(std::chrono::milliseconds(500), [this]() { Tick(); });
 
-  RCLCPP_INFO(get_logger(), "调度中心就绪: 车辆 %zu 台，去重半径 0.8m，最大重试 1 次",
-              robot_ids.size());
+  const auto startup_cfg = queue_.config();
+  RCLCPP_INFO(get_logger(), "调度中心就绪: 车辆 %zu 台，去重半径 %.2fm，最大重试 %u 次",
+              robot_ids.size(), startup_cfg.dedup_radius,
+              static_cast<unsigned>(startup_cfg.default_max_retries));
 }
 
 // ---------------- 事件接入 ----------------
 
 void FleetManagerNode::OnDetection(const fleet_msgs::msg::Detection& msg)
 {
-  if (msg.lost || msg.range <= 0.0f) {
+  if (msg.lost || !std::isfinite(msg.range) || msg.range <= 0.0f ||
+      !std::isfinite(msg.world_pose.x) || !std::isfinite(msg.world_pose.y) ||
+      !std::isfinite(msg.world_pose.z) || !std::isfinite(msg.bearing) ||
+      !std::isfinite(msg.range_sigma) || !std::isfinite(msg.confidence)) {
     return;   // 丢失事件由 agent 的失败原因体现，这里不据此撤任务
   }
   const Color color = ToCoreColor(msg.color);
@@ -226,7 +320,7 @@ void FleetManagerNode::OnDetection(const fleet_msgs::msg::Detection& msg)
   }
 
   const TaskId id = "T" + std::to_string(++task_seq_);
-  if (!queue_.AddTask(id, color, target, NowNs())) {
+  if (!queue_.AddTask(id, color, target, TaskNowNs())) {
     return;
   }
   const Task* t = queue_.Find(id);
@@ -251,7 +345,7 @@ void FleetManagerNode::OnTaskStatus(const fleet_msgs::msg::TaskStatus& msg)
                  t->assigned_robot.c_str());
     return;
   }
-  const TimeNs now = NowNs();
+  const TimeNs now = TaskNowNs();
 
   switch (msg.state) {
     case fleet_msgs::msg::TaskStatus::STATE_ASSIGNED:
@@ -302,6 +396,11 @@ void FleetManagerNode::OnRobotStatus(const fleet_msgs::msg::RobotStatus& msg)
   if (it == robots_.end()) {
     return;
   }
+  if (!IsFinitePose(msg.pose)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "忽略 %s 的非法机器人位姿", msg.robot_id.c_str());
+    return;
+  }
   Robot& r = it->second;
   const bool was_offline = r.state == RobotState::kOffline;
   const bool had_heartbeat = r.last_heartbeat != 0;
@@ -341,7 +440,7 @@ void FleetManagerNode::OnSubmit(
   std::shared_ptr<fleet_msgs::srv::SubmitTask::Response> res)
 {
   const Color color = ToCoreColor(req->target_color);
-  if (color == Color::kUnknown) {
+  if (color == Color::kUnknown || !IsFinitePose(req->target_pose)) {
     res->accepted = false;
     res->message = "target_color 必须是 1/2/3";
     return;
@@ -349,7 +448,7 @@ void FleetManagerNode::OnSubmit(
 
   const TaskId id = "S" + std::to_string(++task_seq_);
   const Pose2D target{req->target_pose.position.x, req->target_pose.position.y, 0.0};
-  const bool ok = queue_.AddTask(id, color, target, NowNs());
+  const bool ok = queue_.AddTask(id, color, target, TaskNowNs());
   res->accepted = ok;
   res->task_id = ok ? id : "";
   res->message = ok ? "任务已创建" : "同色且位置过近的任务已存在";
@@ -366,7 +465,7 @@ void FleetManagerNode::OnCancel(
 {
   const std::string reason = req->reason.empty() ? "CANCELED_BY_OPERATOR" : req->reason;
   const RobotId* robot = RobotOfTask(req->task_id);
-  const bool ok = queue_.Cancel(req->task_id, NowNs(), reason);
+  const bool ok = queue_.Cancel(req->task_id, TaskNowNs(), reason);
 
   if (ok && robot != nullptr) {
     CancelGoal(*robot);
@@ -385,22 +484,28 @@ void FleetManagerNode::OnCancel(
 
 void FleetManagerNode::Tick()
 {
-  const TimeNs now = NowNs();
-  const auto pruned = queue_.Prune(now);
+  // 任务阶段按 ROS 时钟判超时（仿真下 = sim time，与机器人运动同速）；
+  // 心跳/冷却按墙钟判（心跳由 agent 的墙钟定时器发出，不受 RTF 影响）。
+  const TimeNs task_now = TaskNowNs();
+  const TimeNs wall_now = NowNs();
+  const auto pruned = queue_.Prune(task_now);
   if (!pruned.empty()) {
     RCLCPP_INFO(get_logger(), "清理 %zu 个超过保留策略的终态任务", pruned.size());
   }
-  HandleWatchdog(now);
-  AssignPending(now);
+  HandleWatchdog(task_now, wall_now);
+  AssignPending(task_now);
   PublishTaskSnapshot();
   if (publish_markers_) {
     PublishMarkers();
   }
 }
 
-void FleetManagerNode::HandleWatchdog(TimeNs now)
+void FleetManagerNode::HandleWatchdog(TimeNs task_now, TimeNs wall_now)
 {
-  const auto events = watchdog_.Check(queue_.All(), RobotList(), now);
+  // 任务超时用 task_now，机器人离线用 wall_now，两个时钟域不能混用
+  auto events = watchdog_.Check(queue_.All(), {}, task_now);
+  const auto robot_events = watchdog_.Check({}, RobotList(), wall_now);
+  events.insert(events.end(), robot_events.begin(), robot_events.end());
   for (const auto& ev : events) {
     if (ev.kind == TimeoutKind::kRobotOffline) {
       auto& robot = robots_[ev.robot_id];
@@ -420,7 +525,7 @@ void FleetManagerNode::HandleWatchdog(TimeNs now)
     if (ev.kind == TimeoutKind::kAssign) {
       // 长时间没有车能接：直接判失败（PENDING->FAILED 是合法迁移），
       // 重试对它没有意义 —— 再排一次仍然没车可派
-      if (queue_.Transition(ev.task_id, TaskState::kFailed, now, kReasonAssignTimeout)) {
+      if (queue_.Transition(ev.task_id, TaskState::kFailed, task_now, kReasonAssignTimeout)) {
         RCLCPP_WARN(get_logger(), "任务 %s 等待分配超时，置为 FAILED", ev.task_id.c_str());
       }
       continue;
@@ -430,7 +535,7 @@ void FleetManagerNode::HandleWatchdog(TimeNs now)
     if (!robot.empty()) {
       CancelGoal(robot);
     }
-    const bool retried = queue_.RetryOrFail(ev.task_id, now, ev.reason);
+    const bool retried = queue_.RetryOrFail(ev.task_id, task_now, ev.reason);
     RCLCPP_WARN(get_logger(), "任务 %s 超时(%s, 超 %.0fs)，%s", ev.task_id.c_str(),
                 ev.reason.c_str(), static_cast<double>(ev.overdue) / kSecond,
                 retried ? "已重排" : "重试配额用尽");
@@ -528,7 +633,7 @@ void FleetManagerNode::OnGoalResponse(const RobotId& robot, const TaskId& task_i
   // 被拒绝：多半是该车正忙（并发下发的保护），重排等下一拍
   const Task* t = queue_.Find(task_id);
   if (t != nullptr && IsActiveState(t->state)) {
-    queue_.RetryOrFail(task_id, NowNs(), kReasonGoalRejected);
+    queue_.RetryOrFail(task_id, TaskNowNs(), kReasonGoalRejected);
   }
   RCLCPP_WARN(get_logger(), "任务 %s 被 %s 拒绝", task_id.c_str(), robot.c_str());
   ReleaseRobot(robot);
@@ -558,7 +663,7 @@ void FleetManagerNode::OnActionResult(const RobotId& robot, const TaskId& task_i
     return;
   }
 
-  const TimeNs now = NowNs();
+  const TimeNs now = TaskNowNs();
   if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result != nullptr &&
       wrapped.result->success) {
     if (queue_.Transition(task_id, TaskState::kDone, now)) {
@@ -614,7 +719,7 @@ void FleetManagerNode::FailActiveTask(const RobotId& robot, const std::string& r
   }
   const TaskId task_id = it->second;
   CancelGoal(robot);
-  const bool retried = queue_.RetryOrFail(task_id, NowNs(), reason);
+  const bool retried = queue_.RetryOrFail(task_id, TaskNowNs(), reason);
   RCLCPP_WARN(get_logger(), "机器人 %s 上的任务 %s 中止(%s)，%s", robot.c_str(),
               task_id.c_str(), reason.c_str(), retried ? "已重排" : "置为 FAILED");
   const auto goal_it = active_goals_.find(robot);
@@ -755,7 +860,23 @@ const RobotId* FleetManagerNode::RobotOfTask(const TaskId& id) const
 
 TimeNs FleetManagerNode::NowNs() const
 {
+  // 机器人存活/冷却使用单调墙钟：心跳由 agent 的墙钟定时器发出，
+  // 即使仿真暂停或 /clock 不推进也要能判活。
+  return SteadyNowNs();
+}
+
+TimeNs FleetManagerNode::TaskNowNs() const
+{
+  // 任务阶段超时与时间戳使用 ROS 时钟：use_sim_time=true 时就是 sim time，
+  // 与机器人实际运动同速。5 车 headless 时 RTF 约 0.3，若用墙钟，
+  // 165s 的导航预算实际只够 50 sim 秒的运动，任务会被大量误判超时。
   return get_clock()->now().nanoseconds();
+}
+
+TimeNs FleetManagerNode::SteadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 }  // namespace fleet

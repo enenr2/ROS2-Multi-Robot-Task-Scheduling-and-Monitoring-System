@@ -2,14 +2,14 @@
 """端到端冒烟：headless 仿真是否还能走完"注入任务 → 导航 → 对位 → DONE"。
 
 CI 的常规 job 不跑 Gazebo（慢、易受环境影响），这个脚本给 nightly / 手动触发用：
-  1. 等 /map、两车心跳、两套 Nav2 的 navigate_to_pose 就绪
+  1. 等 /map、所有配置车辆心跳、每套 Nav2 的 navigate_to_pose 就绪
   2. 向红色物块 (2.5, 1.5) 注入一个任务
   3. 断言任务在超时内进入 DONE，车回到 IDLE
   4. 失败时打印当前任务表与机器人心跳，便于定位是感知、Nav2 还是调度的问题
 
 用法：
-    ros2 launch fleet_bringup fleet_sim.launch.py gui:=false rviz:=false &
-    python3 scripts/smoke_sim.py --timeout 180
+    ros2 launch fleet_bringup fleet_sim.launch.py robot_count:=3 gui:=false rviz:=false &
+    python3 scripts/smoke_sim.py --robot-count 3 --timeout 180
 """
 import argparse
 import math
@@ -29,7 +29,6 @@ from fleet_msgs.srv import SubmitTask
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 
-ROBOTS = ('robot1', 'robot2')
 # 把蓝色物块挪到一个"没有历史任务"的空位再注入：否则保留期内的去重会直接
 # 复用旧任务，冒烟就退化成"读一个 DONE 快照"
 SMOKE_BLOCK = 'block_blue'
@@ -41,8 +40,9 @@ STATE_DONE = 4
 
 
 class Probe(Node):
-    def __init__(self):
+    def __init__(self, robots):
         super().__init__('fleet_smoke')
+        self.robot_names = tuple(robots)
         self.tasks = {}
         self.robots = {}
         self.task_states = {}
@@ -50,17 +50,16 @@ class Probe(Node):
         self.lock = threading.RLock()
 
         self.create_subscription(Task, '/fleet/tasks', self._on_task, 20)
-        self.create_subscription(TaskStatus, '/robot1/task_status', self._on_status, 50)
-        self.create_subscription(TaskStatus, '/robot2/task_status', self._on_status, 50)
-        self.create_subscription(RobotStatus, '/robot1/robot_status', self._on_robot, 20)
-        self.create_subscription(RobotStatus, '/robot2/robot_status', self._on_robot, 20)
+        for name in self.robot_names:
+            self.create_subscription(TaskStatus, f'/{name}/task_status', self._on_status, 50)
+            self.create_subscription(RobotStatus, f'/{name}/robot_status', self._on_robot, 20)
         self.create_subscription(OccupancyGrid, '/map', self._on_map,
                                  QoSProfile(depth=1,
                                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
                                             reliability=ReliabilityPolicy.RELIABLE))
         self.submit = self.create_client(SubmitTask, '/fleet/submit_task')
         self.nav = {name: ActionClient(self, NavigateToPose, f'/{name}/navigate_to_pose')
-                    for name in ROBOTS}
+                    for name in self.robot_names}
 
     def _on_task(self, msg):
         with self.lock:
@@ -137,10 +136,20 @@ def main():
     parser.add_argument('--timeout', type=float, default=180.0, help='任务完成超时（秒）')
     parser.add_argument('--boot-timeout', type=float, default=120.0, help='仿真就绪超时（秒）')
     parser.add_argument('--world', default='fleet', help='gz 世界名')
+    parser.add_argument('--robot-count', type=int, default=2,
+                        help='参与检查的机器人数量（1 到 5）')
+    parser.add_argument('--robots', default='',
+                        help='逗号分隔的机器人 ID；优先于 --robot-count')
     args = parser.parse_args()
+    if args.robots.strip():
+        robots = tuple(item.strip() for item in args.robots.split(',') if item.strip())
+    else:
+        robots = tuple(f'robot{index}' for index in range(1, args.robot_count + 1))
+    if not 1 <= len(robots) <= 5 or len(set(robots)) != len(robots):
+        parser.error('机器人数量必须在 1 到 5，且 ID 不能重复')
 
     rclpy.init()
-    probe = Probe()
+    probe = Probe(robots)
     executor = SingleThreadedExecutor()
     executor.add_node(probe)
     threading.Thread(target=executor.spin, daemon=True).start()
@@ -152,11 +161,11 @@ def main():
         if not wait_until(probe, lambda: probe.map_received, args.boot_timeout, '/map'):
             ok = False
         if ok and not wait_until(
-                probe, lambda: all(name in probe.robots for name in ROBOTS),
-                args.boot_timeout, '两车心跳'):
+                probe, lambda: all(name in probe.robots for name in robots),
+                args.boot_timeout, '全部机器人心跳'):
             ok = False
         if ok:
-            for name in ROBOTS:
+            for name in robots:
                 if not probe.nav[name].wait_for_server(timeout_sec=args.boot_timeout):
                     print(f'[EE] {name} 的 navigate_to_pose 不可用', file=sys.stderr)
                     ok = False

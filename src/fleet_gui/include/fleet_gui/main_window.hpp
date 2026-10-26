@@ -61,6 +61,7 @@ private:
   void ApplyLive(const std::vector<fleet::monitor::Event>& events);
   void AppendLiveEvent(const fleet::monitor::Event& event);
   void RefreshAll();
+  void ScheduleRefresh();
   void RefreshTables();
   void RefreshHeader();
   void RefreshMap();
@@ -119,7 +120,9 @@ private:
   QLabel* replay_time_{nullptr};
 
   QTimer* tick_timer_{nullptr};
+  QTimer* refresh_timer_{nullptr};
   QTimer* replay_timer_{nullptr};
+  bool refresh_pending_{false};
 };
 
 }  // namespace fleet::gui

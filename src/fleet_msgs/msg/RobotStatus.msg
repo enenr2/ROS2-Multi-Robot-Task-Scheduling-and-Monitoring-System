@@ -7,7 +7,7 @@ uint8 STATE_OFFLINE=3       # 由调度器按心跳超时置位，agent 自身�
 string robot_id
 uint8 state
 
-geometry_msgs/Pose pose      # 平面位姿：z / roll / pitch 恒为 0
+geometry_msgs/Pose pose      # map 系平面位姿（不是 odom）：z / roll / pitch 恒为 0
 string current_task          # 空字符串表示无任务
 uint16 tasks_done
 uint16 tasks_failed

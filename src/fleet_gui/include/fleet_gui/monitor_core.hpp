@@ -126,7 +126,9 @@ std::string FormatAge(int64_t ms);     // 850ms / 3.2s / 2m05s
 class MonitorModel
 {
 public:
-  explicit MonitorModel(int64_t offline_timeout_ms = 2500);
+  // 心跳 1 Hz；给 6 s（6 个周期）容忍 Qt 主线程被地图/相机渲染阻塞的抖动，
+  // 2.5 s 在多车 + 相机场景下会频繁误报离线
+  explicit MonitorModel(int64_t offline_timeout_ms = 6000);
 
   // 返回本次产生的事件（可能为空）
   std::vector<Event> OnTaskSnapshot(const TaskView& task, int64_t now_ms);

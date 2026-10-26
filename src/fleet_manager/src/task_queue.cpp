@@ -49,6 +49,7 @@ bool TaskQueue::AddTask(const TaskId& id, Color color, const Pose2D& target, Tim
   t.target = target;
   t.state = TaskState::kPending;
   t.detected_at = detected_at;
+  t.pending_since = detected_at;
   t.max_retries = cfg_.default_max_retries;
   t.revision = 1;   // 创建即算一次变更，监控端可据此区分"新建"与"更新"
   tasks_.emplace(id, std::move(t));
@@ -80,6 +81,7 @@ bool TaskQueue::Transition(const TaskId& id, TaskState to, TimeNs now,
     t.finished_at = now;
   } else if (to == TaskState::kPending) {
     t.finished_at = 0;   // 重排回队列，不再算终态
+    t.pending_since = now;
   }
   return true;
 }
@@ -119,10 +121,11 @@ bool TaskQueue::RetryOrFail(const TaskId& id, TimeNs now, const std::string& rea
     t.state = TaskState::kPending;
     t.assigned_robot.clear();
     t.assigned_at = 0;
+    t.pending_since = now;
     t.failure_reason = reason;
     t.finished_at = 0;
     ++t.revision;
-    (void)now;   // 重排不记 assigned_at，保留 detected_at 便于做端到端耗时统计
+    // 保留 detected_at 便于做端到端耗时统计；pending_since 为本轮派单预算起点
     return true;
   }
 

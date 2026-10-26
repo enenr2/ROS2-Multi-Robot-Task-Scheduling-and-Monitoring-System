@@ -17,6 +17,7 @@ Task MakeTask(const std::string& id, TaskState st, TimeNs assigned_at, TimeNs de
   t.state = st;
   t.assigned_at = assigned_at;
   t.detected_at = detected_at;
+  t.pending_since = detected_at;
   return t;
 }
 
@@ -51,6 +52,20 @@ TEST(Watchdog, NavTimeoutBoundary)
   EXPECT_EQ(ev.overdue, 1);
 }
 
+TEST(Watchdog, AssignedGoalAckTimeout)
+{
+  WatchdogConfig cfg;
+  cfg.assigned_timeout = 5 * kSecond;
+  Watchdog w(cfg);
+
+  auto t = MakeTask("t1", TaskState::kAssigned, kT0, kT0);
+  TimeoutEvent ev;
+  EXPECT_FALSE(w.IsTaskTimedOut(t, kT0 + 5 * kSecond, &ev));
+  EXPECT_TRUE(w.IsTaskTimedOut(t, kT0 + 5 * kSecond + 1, &ev));
+  EXPECT_EQ(ev.reason, "GOAL_ACK_TIMEOUT");
+  EXPECT_EQ(ev.state_at_timeout, TaskState::kAssigned);
+}
+
 TEST(Watchdog, DockTimeoutFromAssignment)
 {
   WatchdogConfig cfg;
@@ -75,7 +90,32 @@ TEST(Watchdog, PendingAssignTimeoutUsesDetectedAt)
   TimeoutEvent ev;
   EXPECT_FALSE(w.IsTaskTimedOut(t, kT0 + 30 * kSecond, &ev));
   EXPECT_TRUE(w.IsTaskTimedOut(t, kT0 + 30 * kSecond + 1, &ev));
+  EXPECT_EQ(ev.kind, TimeoutKind::kAssign);
   EXPECT_EQ(ev.reason, "ASSIGN_TIMEOUT");
+}
+
+TEST(Watchdog, PendingWithoutDetectedAtIsNotTimedOut)
+{
+  Watchdog w;
+  auto t = MakeTask("t1", TaskState::kPending, 0, 0);
+  TimeoutEvent ev;
+
+  EXPECT_FALSE(w.IsTaskTimedOut(t, kT0 + 999 * kSecond, &ev))
+    << "不完整的待分配任务不能被每个 Tick 重复判定为超时";
+}
+
+TEST(Watchdog, RetriedPendingTaskUsesItsNewQueueStart)
+{
+  WatchdogConfig cfg;
+  cfg.assign_timeout = 30 * kSecond;
+  Watchdog w(cfg);
+  auto t = MakeTask("t1", TaskState::kPending, 0, kT0);
+  t.pending_since = kT0 + 120 * kSecond;
+  TimeoutEvent ev;
+
+  EXPECT_FALSE(w.IsTaskTimedOut(t, kT0 + 121 * kSecond, &ev));
+  EXPECT_TRUE(w.IsTaskTimedOut(t, kT0 + 151 * kSecond, &ev));
+  EXPECT_EQ(ev.kind, TimeoutKind::kAssign);
 }
 
 TEST(Watchdog, TerminalAndAssignedStatesNotJudged)
@@ -84,8 +124,7 @@ TEST(Watchdog, TerminalAndAssignedStatesNotJudged)
   TimeoutEvent ev;
   const TimeNs far_future = kT0 + 3600 * kSecond;
 
-  for (auto st : {TaskState::kDone, TaskState::kFailed, TaskState::kCanceled,
-                  TaskState::kAssigned}) {
+  for (auto st : {TaskState::kDone, TaskState::kFailed, TaskState::kCanceled}) {
     auto t = MakeTask("t1", st, kT0, kT0);
     EXPECT_FALSE(w.IsTaskTimedOut(t, far_future, &ev))
       << "状态 " << ToString(st) << " 不应被超时判定命中";
@@ -166,6 +205,19 @@ TEST(Watchdog, CheckAggregatesTasksAndRobots)
   }
   EXPECT_EQ(task_events, 1);
   EXPECT_EQ(robot_events, 1);
+}
+
+TEST(Watchdog, CheckReturnsAssignEventForExpiredPendingTask)
+{
+  WatchdogConfig cfg;
+  cfg.assign_timeout = 5 * kSecond;
+  Watchdog w(cfg);
+
+  const auto events = w.Check({MakeTask("t_pending", TaskState::kPending, 0, kT0)},
+                              {}, kT0 + 6 * kSecond);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].kind, TimeoutKind::kAssign);
+  EXPECT_EQ(events[0].reason, "ASSIGN_TIMEOUT");
 }
 
 TEST(Watchdog, CheckOnEmptyInputsReturnsNothing)

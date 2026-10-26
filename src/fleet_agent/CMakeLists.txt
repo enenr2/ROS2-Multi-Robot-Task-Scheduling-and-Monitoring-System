@@ -11,6 +11,8 @@ find_package(rclcpp_action REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(fleet_msgs REQUIRED)
 find_package(fleet_manager REQUIRED)
 
@@ -39,6 +41,8 @@ target_link_libraries(robot_agent
   ${nav2_msgs_TARGETS}
   nav_msgs::nav_msgs
   geometry_msgs::geometry_msgs
+  tf2::tf2
+  tf2_ros::tf2_ros
   ${fleet_msgs_TARGETS}
   ${fleet_manager_LIBRARIES}
 )

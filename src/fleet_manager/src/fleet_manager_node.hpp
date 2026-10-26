@@ -54,7 +54,7 @@ private:
 
   // ---- 周期性推进（单线程，全部状态变更集中在这里与上面的回调） ----
   void Tick();
-  void HandleWatchdog(TimeNs now);
+  void HandleWatchdog(TimeNs task_now, TimeNs wall_now);
   void AssignPending(TimeNs now);
 
   // ---- action ----
@@ -75,7 +75,11 @@ private:
   std::vector<Robot> IdleRobots() const;
   const RobotId* RobotOfTask(const TaskId& id) const;
 
+  // 机器人存活/冷却用墙钟（心跳是墙钟 1 Hz，仿真暂停也要能判活）；
+  // 任务阶段超时用 ROS 时钟（仿真下为 sim time，与机器人运动同一基准）。
   TimeNs NowNs() const;
+  TimeNs TaskNowNs() const;
+  static TimeNs SteadyNowNs();
 
   // ---- 配置 ----
   double standoff_{0.6};

@@ -93,13 +93,23 @@ QTableWidget* MakeTable(const QStringList& headers, QWidget* parent)
   return table;
 }
 
-QTableWidgetItem* MakeItem(const QString& text, const QColor& color)
+void UpdateItem(QTableWidget* table, int row, int column, const QString& text,
+                const QColor& color, const QString& tooltip = {})
 {
-  auto* item = new QTableWidgetItem(text);
-  if (color.isValid()) {
+  auto* item = table->item(row, column);
+  if (item == nullptr) {
+    item = new QTableWidgetItem();
+    table->setItem(row, column, item);
+  }
+  if (item->text() != text) {
+    item->setText(text);
+  }
+  if (item->foreground().color() != color) {
     item->setForeground(color);
   }
-  return item;
+  if (item->toolTip() != tooltip) {
+    item->setToolTip(tooltip);
+  }
 }
 
 QString Elide(const QString& text, int max_chars)
@@ -137,6 +147,14 @@ MainWindow::MainWindow(MonitorNode* node, SignalHub* hub, QWidget* parent)
   tick_timer_->setInterval(500);
   connect(tick_timer_, &QTimer::timeout, this, &MainWindow::OnTick);
   tick_timer_->start();
+
+  refresh_timer_ = new QTimer(this);
+  refresh_timer_->setInterval(100);
+  refresh_timer_->setSingleShot(true);
+  connect(refresh_timer_, &QTimer::timeout, this, [this]() {
+    refresh_pending_ = false;
+    RefreshAll();
+  });
 
   replay_timer_ = new QTimer(this);
   replay_timer_->setInterval(100);
@@ -411,25 +429,19 @@ void MainWindow::BuildUi()
 void MainWindow::OnTaskSnapshot(const fleet::monitor::TaskView& task)
 {
   ApplyLive(live_.OnTaskSnapshot(task, QDateTime::currentMSecsSinceEpoch()));
-  if (!replay_active_) {
-    RefreshAll();
-  }
+  ScheduleRefresh();
 }
 
 void MainWindow::OnRobotStatus(const fleet::monitor::RobotView& robot)
 {
   ApplyLive(live_.OnRobotStatus(robot, QDateTime::currentMSecsSinceEpoch()));
-  if (!replay_active_) {
-    RefreshAll();
-  }
+  ScheduleRefresh();
 }
 
 void MainWindow::OnTaskStatus(const fleet::monitor::StatusEvent& status)
 {
   ApplyLive(live_.OnTaskStatus(status, QDateTime::currentMSecsSinceEpoch()));
-  if (!replay_active_) {
-    RefreshAll();
-  }
+  ScheduleRefresh();
 }
 
 void MainWindow::OnMap(const fleet::monitor::MapData& map)
@@ -465,9 +477,7 @@ void MainWindow::OnRobotDiscovered(const QString& robot)
   }
   // 先登记成"离线占位"：agent 没起来时也要在车辆表/地图上留一行
   ApplyLive(live_.EnsureRobot(robot.toStdString(), QDateTime::currentMSecsSinceEpoch()));
-  if (!replay_active_) {
-    RefreshAll();
-  }
+  ScheduleRefresh();
 }
 
 void MainWindow::OnTick()
@@ -479,7 +489,16 @@ void MainWindow::OnTick()
   ApplyLive(live_.Sweep(now));
   // 只保留最近的终态任务：快照会一直重发历史任务，界面不能无限增长
   live_.PruneTasks(now);
-  RefreshAll();
+  ScheduleRefresh();
+}
+
+void MainWindow::ScheduleRefresh()
+{
+  if (replay_active_ || refresh_pending_ || refresh_timer_ == nullptr) {
+    return;
+  }
+  refresh_pending_ = true;
+  refresh_timer_->start();
 }
 
 void MainWindow::ApplyLive(const std::vector<fleet::monitor::Event>& events)
@@ -534,6 +553,7 @@ void MainWindow::RefreshTables()
   // ---- 任务表 ----
   {
     const QSignalBlocker blocker(task_table_);
+    task_table_->setUpdatesEnabled(false);
     const int scroll = task_table_->verticalScrollBar()->value();
     const auto tasks = model.SortedTasks();
     task_table_->setRowCount(static_cast<int>(tasks.size()));
@@ -546,42 +566,35 @@ void MainWindow::RefreshTables()
       const double progress = state == fleet::monitor::kStateDone
                                 ? 1.0 : model.Progress(task.task_id);
 
-      task_table_->setItem(row, 0, MakeItem(id, kText));
-      task_table_->setItem(row, 1,
-                           MakeItem(QString::fromStdString(fleet::monitor::ColorName(task.color)),
-                                    kText));
-      auto* state_item = MakeItem(QString::fromStdString(fleet::monitor::StateName(state)),
-                                  TaskStateColor(state));
+      UpdateItem(task_table_, row, 0, id, kText);
+      UpdateItem(task_table_, row, 1,
+                 QString::fromStdString(fleet::monitor::ColorName(task.color)), kText);
       const QString detail = QString::fromStdString(model.Detail(task.task_id));
-      state_item->setToolTip(detail.isEmpty() ? QStringLiteral("（无详情）") : detail);
-      task_table_->setItem(row, 2, state_item);
-      task_table_->setItem(row, 3,
-                           MakeItem(task.robot.empty()
-                                      ? QStringLiteral("-")
-                                      : QString::fromStdString(task.robot),
-                                    task.robot.empty() ? kDimText : kText));
-      task_table_->setItem(
-        row, 4,
-        MakeItem(QStringLiteral("%1%").arg(static_cast<int>(std::lround(progress * 100.0))),
-                 progress > 0.05 ? kAccent : kDimText));
+      UpdateItem(task_table_, row, 2,
+                 QString::fromStdString(fleet::monitor::StateName(state)), TaskStateColor(state),
+                 detail.isEmpty() ? QStringLiteral("（无详情）") : detail);
+      UpdateItem(task_table_, row, 3,
+                 task.robot.empty() ? QStringLiteral("-") : QString::fromStdString(task.robot),
+                 task.robot.empty() ? kDimText : kText);
+      UpdateItem(task_table_, row, 4,
+                 QStringLiteral("%1%").arg(static_cast<int>(std::lround(progress * 100.0))),
+                 progress > 0.05 ? kAccent : kDimText);
 
       const QString retry = task.max_retry > 0
                               ? QStringLiteral("%1/%2").arg(task.retry).arg(task.max_retry)
                               : QString::number(task.retry);
-      task_table_->setItem(row, 5, MakeItem(retry, task.retry > 0 ? kWarnColor : kDimText));
+      UpdateItem(task_table_, row, 5, retry, task.retry > 0 ? kWarnColor : kDimText);
 
       const QString reason = QString::fromStdString(fleet::monitor::ReasonText(task.failure_reason));
-      task_table_->setItem(
-        row, 6,
-        MakeItem(Elide(reason, 18),
+      UpdateItem(task_table_, row, 6, Elide(reason, 18),
                  task.failure_reason.empty() || task.failure_reason == "NONE" ? kDimText
-                                                                             : kErrorColor));
+                                                                               : kErrorColor);
 
       const QString detected = task.first_seen_ms > 0
                                  ? QString::fromStdString(
                                      fleet::monitor::FormatClock(task.first_seen_ms))
                                  : QStringLiteral("-");
-      task_table_->setItem(row, 7, MakeItem(detected, kDimText));
+      UpdateItem(task_table_, row, 7, detected, kDimText);
 
       if (id == selected_task_) {
         selected_row = row;
@@ -591,11 +604,14 @@ void MainWindow::RefreshTables()
       task_table_->selectRow(selected_row);
     }
     task_table_->verticalScrollBar()->setValue(scroll);
+    task_table_->setUpdatesEnabled(true);
+    task_table_->viewport()->update();
   }
 
   // ---- 车辆表 ----
   {
     const QSignalBlocker blocker(robot_table_);
+    robot_table_->setUpdatesEnabled(false);
     const int scroll = robot_table_->verticalScrollBar()->value();
     const int64_t now = QDateTime::currentMSecsSinceEpoch();
     robot_table_->setRowCount(static_cast<int>(model.robots().size()));
@@ -605,29 +621,22 @@ void MainWindow::RefreshTables()
       const QString state_text =
         robot.online ? QString::fromStdString(fleet::monitor::RobotStateName(robot.state))
                      : QStringLiteral("离线");
-      robot_table_->setItem(row, 0, MakeItem(QString::fromStdString(id), kText));
-      robot_table_->setItem(row, 1, MakeItem(state_text, RobotStateColor(robot.state, robot.online)));
-      robot_table_->setItem(
-        row, 2,
-        MakeItem(QStringLiteral("(%1, %2) %3°")
+      UpdateItem(robot_table_, row, 0, QString::fromStdString(id), kText);
+      UpdateItem(robot_table_, row, 1, state_text, RobotStateColor(robot.state, robot.online));
+      UpdateItem(robot_table_, row, 2, QStringLiteral("(%1, %2) %3°")
                    .arg(robot.x, 0, 'f', 2)
                    .arg(robot.y, 0, 'f', 2)
                    .arg(robot.yaw * 180.0 / 3.14159265358979323846, 0, 'f', 0),
-                 kText));
-      robot_table_->setItem(row, 3,
-                           MakeItem(robot.current_task.empty()
-                                      ? QStringLiteral("-")
-                                      : QString::fromStdString(robot.current_task),
-                                    robot.current_task.empty() ? kDimText : kAccent));
-
-      auto* done_item = MakeItem(QString::number(robot.tasks_done), kDoneColor);
-      robot_table_->setItem(row, 4, done_item);
-      robot_table_->setItem(row, 5,
-                           MakeItem(QString::number(robot.tasks_failed),
-                                    robot.tasks_failed > 0 ? kErrorColor : kDimText));
-      robot_table_->setItem(row, 6,
-                           MakeItem(QString::number(robot.tasks_canceled),
-                                    robot.tasks_canceled > 0 ? kWarnColor : kDimText));
+                 kText);
+      UpdateItem(robot_table_, row, 3,
+                 robot.current_task.empty() ? QStringLiteral("-")
+                                            : QString::fromStdString(robot.current_task),
+                 robot.current_task.empty() ? kDimText : kAccent);
+      UpdateItem(robot_table_, row, 4, QString::number(robot.tasks_done), kDoneColor);
+      UpdateItem(robot_table_, row, 5, QString::number(robot.tasks_failed),
+                 robot.tasks_failed > 0 ? kErrorColor : kDimText);
+      UpdateItem(robot_table_, row, 6, QString::number(robot.tasks_canceled),
+                 robot.tasks_canceled > 0 ? kWarnColor : kDimText);
 
       const QString heartbeat =
         robot.heartbeat_seen
@@ -640,10 +649,12 @@ void MainWindow::RefreshTables()
                    .arg(QString::fromStdString(
                      fleet::monitor::FormatAge(now - robot.last_seen_ms))))
           : QStringLiteral("从未收到");
-      robot_table_->setItem(row, 7, MakeItem(heartbeat, robot.online ? kDimText : kErrorColor));
+      UpdateItem(robot_table_, row, 7, heartbeat, robot.online ? kDimText : kErrorColor);
       ++row;
     }
     robot_table_->verticalScrollBar()->setValue(scroll);
+    robot_table_->setUpdatesEnabled(true);
+    robot_table_->viewport()->update();
   }
 }
 
